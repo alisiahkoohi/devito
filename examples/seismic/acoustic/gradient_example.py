@@ -3,7 +3,7 @@ from numpy import linalg
 from cached_property import cached_property
 
 from devito import TimeFunction, Function
-from examples.seismic import Receiver, RickerSource, demo_model
+from examples.seismic import TimeAxis, Receiver, RickerSource, demo_model
 from examples.seismic.acoustic import ForwardOperator, GradientOperator, smooth10
 
 
@@ -26,11 +26,11 @@ class GradientExample(object):
                            shape=shape, spacing=spacing, nbpml=nbpml)
         self.model = model
         t0 = 0.0
-        self.nt = int(1 + (tn-t0) / self.dt)  # Number of timesteps
-        time = np.linspace(t0, tn, self.nt)  # Discretized time axis
+        time_range = TimeAxis(start=t0, stop=tn, step=self.dt)
+        self.nt = time_range.num
 
         # Define source geometry (center of domain, just below surface)
-        src = RickerSource(name='src', grid=model.grid, f0=0.01, time=time)
+        src = RickerSource(name='src', grid=model.grid, f0=0.01, time_range=time_range)
         src.coordinates.data[0, :] = np.array(model.domain_size) * .5
         src.coordinates.data[0, -1] = model.origin[-1] + 2 * spacing[-1]
 
@@ -38,19 +38,21 @@ class GradientExample(object):
 
         # Define receiver geometry (spread across x, just below surface)
         # We need two receiver fields - one for the true (verification) run
-        rec_t = Receiver(name='rec', grid=model.grid, ntime=self.nt, npoint=nrec)
-        rec_t.coordinates.data[:, 0] = np.linspace(0., model.domain_size[0], num=nrec)
+        rec_t = Receiver(name='rec', grid=model.grid, time_range=time_range,
+                         npoint=nrec)
+        rec_t.coordinates.data[:, 0] = np.linspace(0., model.domain_size[0],
+                                                   num=nrec)
         rec_t.coordinates.data[:, 1:] = src.coordinates.data[0, 1:]
 
         self.rec_t = rec_t
 
         # and the other for the smoothed run
-        self.rec = Receiver(name='rec', grid=model.grid, ntime=self.nt, npoint=nrec,
-                            coordinates=rec_t.coordinates.data)
+        self.rec = Receiver(name='rec', grid=model.grid, time_range=time_range,
+                            npoint=nrec, coordinates=rec_t.coordinates.data)
 
         # Receiver for Gradient
         self.rec_g = Receiver(name="rec", coordinates=self.rec.coordinates.data,
-                              grid=model.grid, dt=self.dt, ntime=self.nt)
+                              grid=model.grid, time_range=time_range)
 
         # Gradient symbol
         self.grad = Function(name="grad", grid=model.grid)
