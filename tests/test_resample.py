@@ -26,9 +26,12 @@ def test_resample():
     src_c = src_b.resample(dt=model.critical_dt)
 
     assert src_a.data.shape == src_c.data.shape
+    assert np.isclose(src_a._time_range.start, src_c._time_range.start)
+    assert np.isclose(src_a._time_range.stop, src_c._time_range.stop)
+    assert np.isclose(src_a._time_range.step, src_c._time_range.step)
+    assert src_a._time_range.num == src_c._time_range.num
 
-    res = src_a.data - src_c.data
-    assert np.linalg.norm(res) < 0.005
+    assert np.isclose(src_a.data, src_c.data, atol=0.002).all()
 
 
 if __name__ == "__main__":
