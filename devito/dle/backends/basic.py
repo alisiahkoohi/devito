@@ -60,7 +60,7 @@ class BasicRewriter(AbstractRewriter):
             # Build a new Iteration/Expression tree with free bounds
             free = []
             for i in target:
-                name, bounds = i.dim.name, i.bounds_symbolic
+                name, bounds = i.dim.name, i.symbolic_bounds
                 # Iteration bounds
                 start = Scalar(name='%s_start' % name, dtype=np.int32)
                 finish = Scalar(name='%s_finish' % name, dtype=np.int32)
@@ -84,7 +84,8 @@ class BasicRewriter(AbstractRewriter):
             # Insert array casts for all non-defined
             f_symbols = FindSymbols('symbolics').visit(free)
             defines = [s.name for s in FindSymbols('defines').visit(free)]
-            casts = [ArrayCast(f) for f in f_symbols if f.name not in defines]
+            casts = [ArrayCast(f) for f in f_symbols
+                     if f.is_Tensor and f.name not in defines]
             free = (List(body=casts), free)
 
             for i in derive_parameters(free):

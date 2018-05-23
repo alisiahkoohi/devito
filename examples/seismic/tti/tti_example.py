@@ -2,29 +2,28 @@ import numpy as np
 from argparse import ArgumentParser
 
 from devito.logger import warning
-from examples.seismic import demo_model, Receiver, RickerSource
+from examples.seismic import demo_model, TimeAxis, Receiver, RickerSource
 from examples.seismic.tti import AnisotropicWaveSolver
 
 
 def tti_setup(shape=(50, 50, 50), spacing=(20.0, 20.0, 20.0), tn=250.0,
-              space_order=4, nbpml=10, **kwargs):
+              space_order=4, nbpml=10, preset='layers-tti', **kwargs):
 
     nrec = 101
     # Two layer model for true velocity
-    model = demo_model('layers-tti', shape=shape, spacing=spacing, nbpml=nbpml)
+    model = demo_model(preset, shape=shape, spacing=spacing, nbpml=nbpml)
     # Derive timestepping from model spacing
     dt = model.critical_dt
     t0 = 0.0
-    nt = int(1 + (tn-t0) / dt)
-    time = np.linspace(t0, tn, nt)
+    time_range = TimeAxis(start=t0, stop=tn, step=dt)
 
     # Define source geometry (center of domain, just below surface)
-    src = RickerSource(name='src', grid=model.grid, f0=0.015, time=time)
+    src = RickerSource(name='src', grid=model.grid, f0=0.015, time_range=time_range)
     src.coordinates.data[0, :] = np.array(model.domain_size) * .5
     src.coordinates.data[0, -1] = model.origin[-1] + 2 * spacing[-1]
 
     # Define receiver geometry (spread across x, lust below surface)
-    rec = Receiver(name='nrec', grid=model.grid, ntime=nt, npoint=nrec)
+    rec = Receiver(name='nrec', grid=model.grid, time_range=time_range, npoint=nrec)
     rec.coordinates.data[:, 0] = np.linspace(0., model.domain_size[0], num=nrec)
     rec.coordinates.data[:, 1:] = src.coordinates.data[0, 1:]
 
@@ -51,6 +50,8 @@ if __name__ == "__main__":
     parser = ArgumentParser(description=description)
     parser.add_argument('--2d', dest='dim2', default=False, action='store_true',
                         help="Preset to determine the physical problem setup")
+    parser.add_argument('--noazimuth', dest='azi', default=False, action='store_true',
+                        help="Whether or not to use an azimuth angle")
     parser.add_argument('-a', '--autotune', default=False, action='store_true',
                         help="Enable autotuning for block sizes")
     parser.add_argument("-so", "--space_order", default=4,
@@ -69,6 +70,7 @@ if __name__ == "__main__":
                         help="Devito loop engine (DSE) mode")
     args = parser.parse_args()
 
+    preset = 'layers-tti-noazimuth' if args.azi else 'layers-tti'
     # 3D preset parameters
     if args.dim2:
         shape = (150, 150)
@@ -81,4 +83,4 @@ if __name__ == "__main__":
 
     run(shape=shape, spacing=spacing, nbpml=args.nbpml, tn=tn,
         space_order=args.space_order, autotune=args.autotune, dse=args.dse,
-        dle=args.dle, kernel=args.kernel)
+        dle=args.dle, kernel=args.kernel, preset=preset)

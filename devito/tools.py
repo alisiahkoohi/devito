@@ -1,17 +1,28 @@
-import numpy as np
+from abc import ABC
 import os
-import ctypes
 import inspect
-from collections import Callable, Iterable, OrderedDict, Hashable
-from functools import partial, wraps
+import ctypes
+from collections import Callable, Iterable, OrderedDict, Hashable, Mapping
+from decorator import decorator
+from functools import partial, wraps, reduce
 from itertools import chain, combinations, product, zip_longest
+from operator import attrgetter, mul
 from subprocess import DEVNULL, PIPE, Popen, CalledProcessError, check_output
+
 import cpuinfo
+import numpy as np
 from distutils import version
 
+from multidict import MultiDict
+
+from devito.logger import error
 from devito.parameters import configuration
 
 __all__ = ['memoized_func', 'memoized_meth', 'infer_cpu', 'sweep', 'silencio']
+
+
+def prod(iterable):
+    return reduce(mul, iterable, 1)
 
 
 def as_tuple(item, type=None, length=None):
@@ -46,10 +57,32 @@ def is_integer(value):
     return isinstance(value, int) or isinstance(value, np.integer)
 
 
+def generator():
+    """
+    Return a function ``f`` that generates integer numbers starting at 0
+    with stepping 1.
+    """
+    def f():
+        ret = f.counter
+        f.counter += 1
+        return ret
+    f.counter = 0
+    return f
+
+
 def grouper(iterable, n):
     """Split an interable into groups of size n, plus a reminder"""
     args = [iter(iterable)] * n
     return ([e for e in t if e is not None] for t in zip_longest(*args))
+
+
+def split(iterable, f):
+    """Split an iterable ``I`` into two iterables ``I1`` and ``I2`` of the
+    same type as ``I``. ``I1`` contains all elements ``e`` in ``I`` for
+    which ``f(e)`` returns True; ``I2`` is the complement of ``I1``."""
+    i1 = type(iterable)(i for i in iterable if f(i))
+    i2 = type(iterable)(i for i in iterable if not f(i))
+    return i1, i2
 
 
 def roundm(x, y):
@@ -105,47 +138,75 @@ def filter_ordered(elements, key=None):
 
 
 def filter_sorted(elements, key=None):
-    """Filter elements in a list and sort them by key"""
+    """Filter elements in a list and sort them by key. The default key is
+    ``operator.attrgetter('name')``."""
+    if key is None:
+        key = attrgetter('name')
     return sorted(filter_ordered(elements, key=key), key=key)
 
 
-def partial_order(elements):
-    """Compute a partial order for the items in ``elements``. If a partial order
-    cannot be established, return the empty list. If multiple partial orderings are
-    possible, determinism in ensured."""
-    elements = [i for i in elements if i]
-
-    # Compute items dependencies
+def build_dependence_lists(elements):
+    """
+    Given an iterable of dependences, return the dependence lists as a
+    mapper suitable for graph-like algorithms. A dependence is an iterable of
+    elements ``[a, b, c, ...]``, meaning that ``a`` preceeds ``b`` and ``c``,
+    ``b`` preceeds ``c``, and so on.
+    """
     mapper = OrderedDict()
-    for i in elements:
-        shifted = list(i)
-        last = shifted.pop()
-        for j, k in zip(shifted, i[1:]):
-            handle = mapper.setdefault(j, [])
-            if k not in handle:
-                handle.append(k)
-        mapper.setdefault(last, [])
+    for element in elements:
+        for idx, i0 in enumerate(element):
+            v = mapper.setdefault(i0, set())
+            for i1 in element[idx + 1:]:
+                v.add(i1)
+    return mapper
 
-    # In a partially ordered set, there can be no cyclic dependencies amongst
-    # items, so there must always be at least one root.
-    roots = OrderedDict([(k, v) for k, v in mapper.items()
-                         if k not in flatten(mapper.values())])
 
-    # Start by queuing up roots
-    ordering = []
-    queue = []
-    for k, v in roots.items():
-        ordering.append(k)
-        queue += [(i, k) for i in v]
+def toposort(data):
+    """
+    Given items that depend on other items, a topological sort arranges items in
+    order that no one item precedes an item it depends on.
 
-    # Compute the partial orders from roots
-    while queue:
-        item, prev = queue.pop(0)
-        if item not in ordering:
-            ordering.append(item)
-        queue = [(i, item) for i in mapper[item]] + queue
+    ``data`` captures the various dependencies. It may be:
 
-    return ordering
+        * A dictionary whose keys are items and whose values are a set of
+          dependent items. The dictionary may contain self-dependencies
+          (which are ignored), and dependent items that are not also
+          dict keys.
+        * An iterable of dependences as expected by :func:`build_dependence_lists`.
+
+    Readapted from: ::
+
+        http://code.activestate.com/recipes/577413/
+    """
+    if not isinstance(data, Mapping):
+        assert isinstance(data, Iterable)
+        data = build_dependence_lists(data)
+
+    processed = []
+
+    if not data:
+        return processed
+
+    # Do not transform `data` in place
+    mapper = OrderedDict([(k, set(v)) for k, v in data.items()])
+
+    # Ignore self dependencies
+    for k, v in mapper.items():
+        v.discard(k)
+
+    # Perform the topological sorting
+    extra_items_in_deps = reduce(set.union, mapper.values()) - set(mapper)
+    mapper.update(OrderedDict([(item, set()) for item in extra_items_in_deps]))
+    while True:
+        ordered = set(item for item, dep in mapper.items() if not dep)
+        if not ordered:
+            break
+        processed = filter_sorted(ordered) + processed
+        mapper = OrderedDict([(item, (dep - ordered)) for item, dep in mapper.items()
+                              if item not in ordered])
+    if len(processed) != len(set(flatten(data) + flatten(data.values()))):
+        raise ValueError("A cyclic dependency exists amongst %r" % data)
+    return processed
 
 
 def numpy_to_ctypes(dtype):
@@ -565,7 +626,204 @@ class EnrichedTuple(tuple):
     """
     A tuple with an arbitrary number of additional attributes.
     """
-    def __new__(cls, *items, **kwargs):
+    def __new__(cls, *items, getters=None, **kwargs):
         obj = super(EnrichedTuple, cls).__new__(cls, items)
         obj.__dict__.update(kwargs)
+        obj._getters = dict(zip(getters or [], items))
         return obj
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return super(EnrichedTuple, self).__getitem__(key)
+        else:
+            return self._getters[key]
+
+
+class ReducerMap(MultiDict):
+    """
+    Specialised :class:`MultiDict` object that maps a single key to a
+    list of potential values and provides a reduction method for
+    retrieval.
+    """
+
+    def update(self, values):
+        """
+        Update internal mapping with standard dictionary semantics.
+        """
+        if isinstance(values, Mapping):
+            self.extend(values)
+        elif isinstance(values, Iterable) and not isinstance(values, str):
+            for v in values:
+                self.extend(v)
+        else:
+            self.extend(values)
+
+    def unique(self, key):
+        """
+        Returns a unique value for a given key, if such a value
+        exists, and raises a ``ValueError`` if it does not.
+
+        :param key: Key for which to retrieve a unique value
+        """
+        candidates = self.getall(key)
+
+        def compare_to_first(v):
+            first = candidates[0]
+            if isinstance(first, np.ndarray) or isinstance(v, np.ndarray):
+                return (first == v).all()
+            else:
+                return first == v
+
+        if len(candidates) == 1:
+            return candidates[0]
+        elif all(map(compare_to_first, candidates)):
+            return candidates[0]
+        else:
+            error("Unable to find unique value for key %s, candidates: %s" %
+                  (key, candidates))
+            raise ValueError('Inconsistent values for key reduction')
+
+    def reduce(self, key, op=None):
+        """
+        Returns a reduction of all candidate values for a given key.
+
+        :param key: Key for which to retrieve candidate values
+        :param op: Operator for reduction among candidate values.
+                   If not provided, a unique value will be returned,
+                   or a ``ValueError`` raised if no unique value exists.
+        """
+        if op is None:
+            # Return a unique value if it exists
+            return self.unique(key)
+        else:
+            return reduce(op, self.getall(key))
+
+    def reduce_all(self):
+        """
+        Returns a dictionary with reduced/unique values for all keys.
+        """
+        return {k: self.reduce(key=k) for k in self}
+
+
+class Tag(ABC):
+
+    """
+    An abstract class to define categories of object decorators.
+
+    .. note::
+
+        This class must be subclassed for each new category.
+    """
+
+    _repr = 'AbstractTag'
+
+    _KNOWN = []
+
+    def __init__(self, name, val=None):
+        self.name = name
+        self.val = val
+
+        self._KNOWN.append(self)
+
+    def __eq__(self, other):
+        if not isinstance(other, self.__class__):
+            return False
+        return self.name == other.name and self.val == other.val
+
+    def __hash__(self):
+        return hash((self.name, self.val))
+
+    def __str__(self):
+        return self.name if self.val is None else '%s%s' % (self.name, str(self.val))
+
+    def __repr__(self):
+        if self.val is None:
+            return "%s: %s" % (self._repr, self.name)
+        else:
+            return "%s: %s[%s]" % (self._repr, self.name, str(self.val))
+
+
+# Method/function arguments validation
+
+class validate_base(object):
+
+    """Decorator to validate arguments
+
+    Formal parameters that don't exist in the definition of the function
+    being decorated as well as actual arguments not being present when
+    the validation is called are silently ignored.
+
+    Readapted from: ::
+
+        https://github.com/OP2/PyOP2/
+    """
+
+    def __init__(self, *checks):
+        self._checks = checks
+
+    def __call__(self, f):
+        def wrapper(f, *args, **kwargs):
+            if configuration["develop-mode"]:
+                self.nargs = f.__code__.co_argcount
+                self.defaults = f.__defaults__ or ()
+                self.varnames = f.__code__.co_varnames
+                self.file = f.__code__.co_filename
+                self.line = f.__code__.co_firstlineno + 1
+                self.check_args(args, kwargs)
+            return f(*args, **kwargs)
+        return decorator(wrapper, f)
+
+    def check_args(self, args, kwargs):
+        for argname, argcond, exception in self._checks:
+            # If the argument argname is not present in the decorated function
+            # silently ignore it
+            try:
+                i = self.varnames.index(argname)
+            except ValueError:
+                # No formal parameter argname
+                continue
+            # Try the argument by keyword first, and by position second.
+            # If the argument isn't given, silently ignore it.
+            try:
+                arg = kwargs.get(argname)
+                arg = arg or args[i]
+            except IndexError:
+                # No actual parameter argname
+                continue
+            # If the argument has a default value, also accept that (since the
+            # constructor will be able to deal with that)
+            default_index = i - self.nargs + len(self.defaults)
+            if default_index >= 0 and arg == self.defaults[default_index]:
+                continue
+            self.check_arg(arg, argcond, exception)
+
+
+class validate_type(validate_base):
+
+    """
+    Decorator to validate argument types
+
+    The decorator expects one or more arguments, which are 3-tuples of
+    (name, type, exception), where name is the argument name in the
+    function being decorated, type is the argument type to be validated
+    and exception is the exception type to be raised if validation fails.
+
+    Readapted from: ::
+
+        https://github.com/OP2/PyOP2/
+    """
+
+    def __init__(self, *checks):
+        processed = []
+        for i in checks:
+            try:
+                argname, argtype = i
+                processed.append((argname, argtype, TypeError))
+            except ValueError:
+                processed.append(i)
+        super(validate_type, self).__init__(*processed)
+
+    def check_arg(self, arg, argtype, exception):
+        if not isinstance(arg, argtype):
+            raise exception("%s:%d Parameter %s must be of type %r"
+                            % (self.file, self.line, arg, argtype))

@@ -3,7 +3,7 @@
 ![Build Status](https://travis-ci.org/opesci/devito.svg?branch=master)
 ![Code Coverage](https://codecov.io/gh/opesci/devito/branch/master/graph/badge.svg)
 
-[Devito](http://www.opesci.org/devito-public) is a software to
+[Devito](http://www.devitoproject.org) is a software to
 implement optimised finite difference (FD) computation from
 high-level symbolic problem definitions. Starting from symbolic
 equations defined in [SymPy](http://www.sympy.org/en/index.html),
@@ -12,8 +12,8 @@ compilation to execute FD kernels on multiple computer platforms.
 
 Devito is part of the [OPESCI](http://www.opesci.org) seismic imaging
 project. A general overview of Devito features and capabilities can be
-found [here](http://www.opesci.org/devito-public), including a
-detailed [API documentation](http://www.opesci.org/devito).
+found [here](http://www.devitoproject.org), including a
+detailed [API documentation](http://www.devitoproject.org).
 
 ## Get in touch
 
@@ -31,12 +31,28 @@ provided at the download links. You will need the Python 3.6 version.
 
 To install Devito, including examples, tests and tutorial notebooks, 
 follow these simple passes:
-```
+
+```sh
 git clone https://github.com/opesci/devito.git
 cd devito
 conda env create -f environment.yml
 source activate devito
 pip install -e .
+```
+
+Alternatively, you can also install and run Devito via
+[Docker](https://www.docker.com/):
+
+```sh
+# get the code
+git clone https://github.com/opesci/devito.git
+cd devito
+
+# run the tests
+docker-compose run devito /tests
+
+# start a jupyter notebook server on port 8888
+docker-compose up devito
 ```
 
 ## Examples
@@ -80,9 +96,16 @@ Thread parallel execution via OpenMP can also be enabled by setting
 
 For the full list of available environment variables and their
 possible values, simply run:
-```
+
+```py
 from devito import print_defaults
 print_defaults()
+```
+
+Or with Docker, run:
+
+```sh
+docker-compose run devito /print-defaults
 ```
 
 ## Performance optimizations

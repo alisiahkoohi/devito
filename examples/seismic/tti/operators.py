@@ -380,9 +380,9 @@ def ForwardOperator(model, source, receiver, space_order=4,
     v = TimeFunction(name='v', grid=model.grid,
                      save=source.nt if save else None,
                      time_order=2, space_order=space_order)
-    src = PointSource(name='src', grid=model.grid, ntime=source.nt,
+    src = PointSource(name='src', grid=model.grid, time_range=source.time_range,
                       npoint=source.npoint)
-    rec = Receiver(name='rec', grid=model.grid, ntime=receiver.nt,
+    rec = Receiver(name='rec', grid=model.grid, time_range=receiver.time_range,
                    npoint=receiver.npoint)
 
     # Tilt and azymuth setup
@@ -410,9 +410,9 @@ def ForwardOperator(model, source, receiver, space_order=4,
     stencils = [first_stencil, second_stencil]
 
     # Source and receivers
-    stencils += src.inject(field=u.forward, expr=src * dt * dt / m,
+    stencils += src.inject(field=u.forward, expr=src * dt**2 / (m * u.grid.volume_cell),
                            offset=model.nbpml)
-    stencils += src.inject(field=v.forward, expr=src * dt * dt / m,
+    stencils += src.inject(field=v.forward, expr=src * dt**2 / (m * v.grid.volume_cell),
                            offset=model.nbpml)
     stencils += rec.interpolate(expr=u + v, offset=model.nbpml)
 

@@ -3,9 +3,9 @@ from collections import OrderedDict
 from devito.ir.support import (Scope, IterationSpace, detect_flow_directions,
                                force_directions, group_expressions)
 from devito.ir.clusters.cluster import PartialCluster, ClusterGroup
-from devito.symbolics import CondEq, CondNe, IntDiv, xreplace_indices
+from devito.symbolics import CondEq, IntDiv, xreplace_indices
 from devito.types import Scalar
-from devito.tools import flatten, powerset
+from devito.tools import filter_sorted, flatten
 
 __all__ = ['clusterize', 'groupby']
 
@@ -32,9 +32,14 @@ def groupby(clusters):
         for candidate in reversed(list(processed)):
             # Collect all relevant data dependences
             scope = Scope(exprs=candidate.exprs + c.exprs)
+
+            # Collect anti-dependences preventing grouping
             anti = scope.d_anti.carried() - scope.d_anti.increment
-            flow = scope.d_flow - (scope.d_flow.inplace() + scope.d_flow.increment)
             funcs = [i.function for i in anti]
+
+            # Collect flow-dependences breaking the search
+            flow = scope.d_flow - (scope.d_flow.inplace() + scope.d_flow.increment)
+
             if candidate.ispace.is_compatible(c.ispace) and\
                     all(is_local(i, candidate, c, clusters) for i in funcs):
                 # /c/ will be fused into /candidate/. All fusion-induced anti
@@ -53,9 +58,9 @@ def groupby(clusters):
             elif anti:
                 # Data dependences prevent fusion with earlier clusters, so
                 # must break up the search
-                c.atomics.update(set(anti.cause))
+                c.atomics.update(anti.cause)
                 break
-            elif set(flow).intersection(candidate.atomics):
+            elif flow.cause & candidate.atomics:
                 # We cannot even attempt fusing with earlier clusters, as
                 # otherwise the existing flow dependences wouldn't be honored
                 break
@@ -68,35 +73,37 @@ def groupby(clusters):
 
 def guard(clusters):
     """
-    Return a new :class:`ClusterGroup` including new :class:`PartialCluster`s
+    Return a new :class:`ClusterGroup` with a new :class:`PartialCluster`
     for each conditional expression encountered in ``clusters``.
     """
     processed = ClusterGroup()
     for c in clusters:
-        # Find out what expressions in /c/ should be guarded
-        mapper = {}
+        # Separate the expressions that should be guarded from the free ones
+        mapper = OrderedDict()
+        free = []
         for e in c.exprs:
+            found = []
             for k, v in e.ispace.sub_iterators.items():
                 for i in v:
                     if i.dim.is_Conditional:
-                        mapper.setdefault(i.dim, []).append(e)
+                        found.append(i.dim)
+            if found:
+                mapper.setdefault(tuple(filter_sorted(found)), []).append(e)
+            else:
+                free.append(e)
 
-        # Build conditional expressions to guard clusters
-        conditions = {d: CondEq(d.parent % d.factor, 0) for d in mapper}
-        negated = {d: CondNe(d.parent % d.factor, 0) for d in mapper}
+        # Some expressions may not require guards at all. We put them in their
+        # own cluster straigh away
+        if free:
+            processed.append(PartialCluster(free, c.ispace, c.dspace, c.atomics))
 
-        # Expand with guarded clusters
-        combs = list(powerset(mapper))
-        for dims, ndims in zip(combs, reversed(combs)):
-            banned = flatten(v for k, v in mapper.items() if k not in dims)
-            exprs = [e.xreplace({i: IntDiv(i.parent, i.factor) for i in mapper})
-                     for e in c.exprs if e not in banned]
-            guards = [(i.parent, conditions[i]) for i in dims]
-            guards.extend([(i.parent, negated[i]) for i in ndims])
-            cluster = PartialCluster(exprs, c.ispace, c.atomics, dict(guards))
-            processed.append(cluster)
+        # Then we add in all guarded clusters
+        for k, v in mapper.items():
+            exprs = [e.xreplace({d: IntDiv(d.parent, d.factor) for d in k}) for e in v]
+            guards = {d.parent: CondEq(d.parent % d.factor, 0) for d in k}
+            processed.append(PartialCluster(exprs, c.ispace, c.dspace, c.atomics, guards))
 
-    return processed
+    return ClusterGroup(processed)
 
 
 def is_local(array, source, sink, context):
@@ -124,7 +131,7 @@ def is_local(array, source, sink, context):
                 written_once = False
                 break
             reads = [j.base.function for j in i.reads]
-            if any(j.is_SymbolicFunction or j.is_Scalar for j in reads):
+            if any(j.is_TensorFunction or j.is_Scalar for j in reads):
                 # Can't guarantee its value only depends on local data
                 written_once = False
                 break
@@ -200,8 +207,8 @@ def bump_and_contract(targets, source, sink):
             processed.append(e.func(e.lhs, e.rhs.xreplace(mapper)))
         else:
             for i in sink.tensors[function]:
-                scalarized = Scalar(name='s%d' % len(mapper)).indexify()
-                mapper[i] = scalarized
+                scalar = Scalar(name='s%s%d' % (i.function.name, len(mapper))).indexify()
+                mapper[i] = scalar
 
                 # Index bumping
                 assert len(function.indices) == len(e.lhs.indices) == len(i.indices)
@@ -209,7 +216,7 @@ def bump_and_contract(targets, source, sink):
                             zip(function.indices, e.lhs.indices, i.indices)}
 
                 # Array contraction
-                handle = e.func(scalarized, e.rhs.xreplace(mapper))
+                handle = e.func(scalar, e.rhs.xreplace(mapper))
                 handle = xreplace_indices(handle, shifting)
                 processed.append(handle)
     source.exprs = processed
@@ -221,36 +228,32 @@ def bump_and_contract(targets, source, sink):
 
 def clusterize(exprs):
     """Group a sequence of :class:`ir.Eq`s into one or more :class:`Cluster`s."""
-
     # Group expressions based on data dependences
     groups = group_expressions(exprs)
 
     clusters = ClusterGroup()
+
+    # Coerce iteration direction of each expression in each group
     for g in groups:
-        # Coerce iteration space of each expression in each group
-        mapper = OrderedDict([(e, e.ispace) for e in g])
+        mapper = OrderedDict([(e, e.directions) for e in g])
         flowmap = detect_flow_directions(g)
         queue = list(g)
         while queue:
-            v = queue.pop(0)
-
-            intervals, sub_iterators, directions = mapper[v].args
-            forced, clashes = force_directions(flowmap, lambda i: directions.get(i))
-            for e in g:
-                intervals = intervals.intersection(mapper[e].intervals.drop(clashes))
-            directions = {i: forced[i] for i in directions}
-            coerced_ispace = IterationSpace(intervals, sub_iterators, directions)
-
+            k = queue.pop(0)
+            directions, _ = force_directions(flowmap, lambda i: mapper[k].get(i))
+            directions = {i: directions[i] for i in mapper[k]}
             # Need update propagation ?
-            if coerced_ispace != mapper[v]:
-                mapper[v] = coerced_ispace
+            if directions != mapper[k]:
+                mapper[k] = directions
                 queue.extend([i for i in g if i not in queue])
 
         # Wrap each tensor expression in a PartialCluster
         for k, v in mapper.items():
             if k.is_Tensor:
                 scalars = [i for i in g[:g.index(k)] if i.is_Scalar]
-                clusters.append(PartialCluster(scalars + [k], v))
+                intervals, sub_iterators, _ = k.ispace.args
+                ispace = IterationSpace(intervals, sub_iterators, v)
+                clusters.append(PartialCluster(scalars + [k], ispace, k.dspace))
 
     # Group PartialClusters together where possible
     clusters = groupby(clusters)

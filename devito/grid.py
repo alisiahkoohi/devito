@@ -2,6 +2,7 @@ from devito.tools import as_tuple
 from devito.dimension import SpaceDimension, TimeDimension, SteppingDimension
 from devito.base import Constant
 
+from sympy import prod
 import numpy as np
 
 __all__ = ['Grid']
@@ -70,20 +71,21 @@ class Grid(object):
             # Create the spatial dimensions and constant spacing symbols
             assert(self.dim <= 3)
             dim_names = self._default_dimensions[:self.dim]
-            dim_spacing = tuple(Constant(name='h_%s' % name, value=val)
+            dim_spacing = tuple(Constant(name='h_%s' % name, value=val, dtype=self.dtype)
                                 for name, val in zip(dim_names, self.spacing))
             self.dimensions = tuple(SpaceDimension(name=name, spacing=spc)
                                     for name, spc in zip(dim_names, dim_spacing))
         else:
             self.dimensions = dimensions
 
-        self.origin = tuple(Constant(name='o_%s' % dim.name, value=val)
+        self.origin = tuple(Constant(name='o_%s' % dim.name, value=val, dtype=self.dtype)
                             for dim, val in zip(self.dimensions, origin))
         # TODO: Raise proper exceptions and logging
         assert (self.dim == len(self.origin) == len(self.extent) == len(self.spacing))
         # Store or create default symbols for time and stepping dimensions
         if time_dimension is None:
-            self.time_dim = TimeDimension(name='time', spacing=Constant(name='dt'))
+            self.time_dim = TimeDimension(name='time',
+                                          spacing=Constant(name='dt', dtype=self.dtype))
             self.stepping_dim = SteppingDimension(name='t', parent=self.time_dim)
         elif isinstance(time_dimension, TimeDimension):
             self.time_dim = time_dimension
@@ -103,9 +105,17 @@ class Grid(object):
         return len(self.shape)
 
     @property
+    def volume_cell(self):
+        """
+        Volume of a single cell e.g  h_x*h_y*h_z in 3D
+        """
+        return prod(d.spacing for d in self.dimensions).subs(self.spacing_map)
+
+    @property
     def spacing(self):
         """Spacing between grid points in m."""
-        return as_tuple(np.array(self.extent) / (np.array(self.shape) - 1))
+        spacing = (np.array(self.extent) / (np.array(self.shape) - 1)).astype(self.dtype)
+        return as_tuple(spacing)
 
     @property
     def spacing_symbols(self):

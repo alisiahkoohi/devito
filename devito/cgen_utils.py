@@ -1,6 +1,8 @@
 from collections import OrderedDict
 
+import numpy as np
 import cgen as c
+
 from mpmath.libmp import prec_to_dps, to_str
 from sympy import Function
 from sympy.printing.ccode import C99CodePrinter
@@ -28,16 +30,15 @@ class Allocator(object):
     def push_heap(self, obj):
         """
         Generate cgen objects to declare, allocate memory, and free memory for
-        ``obj``, of type :class:`SymbolicData`.
+        ``obj``, of type :class:`Array`.
         """
         if obj in self.heap:
             return
 
-        decl = "(*%s)%s" % (obj.name,
-                            "".join("[%s]" % i.symbolic_size for i in obj.indices[1:]))
+        decl = "(*%s)%s" % (obj.name, "".join("[%s]" % i for i in obj.symbolic_shape[1:]))
         decl = c.Value(c.dtype_to_ctype(obj.dtype), decl)
 
-        shape = "".join("[%s]" % i.symbolic_size for i in obj.indices)
+        shape = "".join("[%s]" % i for i in obj.symbolic_shape)
         alloc = "posix_memalign((void**)&%s, 64, sizeof(%s%s))"
         alloc = alloc % (obj.name, c.dtype_to_ctype(obj.dtype), shape)
         alloc = c.Statement(alloc)
@@ -59,13 +60,14 @@ class Allocator(object):
 
 class CodePrinter(C99CodePrinter):
 
-    custom_functions = {'INT': '(int)', 'FLOAT': '(float)'}
+    custom_functions = {'INT': '(int)', 'FLOAT': '(float)', 'DOUBLE': '(double)'}
 
     """Decorator for sympy.printing.ccode.CCodePrinter.
 
     :param settings: A dictionary containing relevant settings
     """
-    def __init__(self, settings={}):
+    def __init__(self, dtype=np.float32, settings={}):
+        self.dtype = dtype
         C99CodePrinter.__init__(self, settings)
         self.known_functions.update(self.custom_functions)
 
@@ -100,8 +102,10 @@ class CodePrinter(C99CodePrinter):
         # to be 32-bit floats.
         # http://en.cppreference.com/w/cpp/language/floating_literal
         p, q = int(expr.p), int(expr.q)
-
-        return '%d.0F/%d.0F' % (p, q)  # float precision by default
+        if self.dtype == np.float64:
+            return '%d.0/%d.0' % (p, q)
+        else:
+            return '%d.0F/%d.0F' % (p, q)
 
     def _print_Mod(self, expr):
         """Print mod using % operator in C++
@@ -141,7 +145,9 @@ class CodePrinter(C99CodePrinter):
         elif rv.startswith('.0'):
             rv = '0.' + rv[2:]
 
-        return rv + 'F'
+        if self.dtype == np.float32:
+            rv = rv + 'F'
+        return rv
 
     def _print_FrozenExpr(self, expr):
         return self._print(expr.args[0])
@@ -157,14 +163,14 @@ class CodePrinter(C99CodePrinter):
         return str(expr)
 
 
-def ccode(expr, **settings):
+def ccode(expr, dtype=np.float32, **settings):
     """Generate C++ code from an expression calling CodePrinter class
 
     :param expr: The expression
     :param settings: A dictionary of settings for code printing
     :returns: The resulting code as a string. If it fails, then it returns the expr
     """
-    return CodePrinter(settings).doprint(expr, None)
+    return CodePrinter(dtype=dtype, settings=settings).doprint(expr, None)
 
 
 blankline = c.Line("")
@@ -172,3 +178,6 @@ printmark = lambda i: c.Line('printf("Here: %s\\n"); fflush(stdout);' % i)
 printvar = lambda i: c.Statement('printf("%s=%%s\\n", %s); fflush(stdout);' % (i, i))
 INT = Function('INT')
 FLOAT = Function('FLOAT')
+DOUBLE = Function('DOUBLE')
+
+cast_mapper = {np.float32: FLOAT, float: DOUBLE, np.float64: DOUBLE}

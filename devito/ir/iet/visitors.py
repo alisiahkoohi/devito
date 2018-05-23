@@ -209,11 +209,16 @@ class CGen(Visitor):
         return o.element
 
     def visit_Expression(self, o):
-        return c.Assign(ccode(o.expr.lhs), ccode(o.expr.rhs))
+        return c.Assign(ccode(o.expr.lhs, dtype=o.dtype),
+                        ccode(o.expr.rhs, dtype=o.dtype))
 
     def visit_LocalExpression(self, o):
         return c.Initializer(c.Value(c.dtype_to_ctype(o.dtype),
-                             ccode(o.expr.lhs)), ccode(o.expr.rhs))
+                             ccode(o.expr.lhs, dtype=o.dtype)),
+                             ccode(o.expr.rhs, dtype=o.dtype))
+
+    def visit_ForeignExpression(self, o):
+        return c.Statement(ccode(o.expr))
 
     def visit_Call(self, o):
         arguments = self._args_call(o.params)
@@ -252,12 +257,12 @@ class CGen(Visitor):
 
         # For backward direction flip loop bounds
         if o.direction == Backward:
-            loop_init = 'int %s = %s' % (o.index, ccode('%s - 1' % end))
+            loop_init = 'int %s = %s' % (o.index, ccode(end))
             loop_cond = '%s >= %s' % (o.index, ccode(start))
             loop_inc = '%s -= %s' % (o.index, o.limits[2])
         else:
             loop_init = 'int %s = %s' % (o.index, ccode(start))
-            loop_cond = '%s < %s' % (o.index, ccode(end))
+            loop_cond = '%s <= %s' % (o.index, ccode(end))
             loop_inc = '%s += %s' % (o.index, o.limits[2])
 
         # Append unbounded indices, if any
@@ -400,13 +405,11 @@ class FindSymbols(Visitor):
     :param mode: Drive the search. Accepted values are: ::
 
         * 'symbolics': Collect :class:`AbstractSymbol` objects.
-        * 'symbolics-writes': Collect written :class:`AbstractSymbol` objects.
         * 'free-symbols': Collect all free symbols.
     """
 
     rules = {
         'symbolics': lambda e: e.functions,
-        'symbolics-writes': lambda e: as_tuple(e.write),
         'free-symbols': lambda e: e.free_symbols,
         'defines': lambda e: as_tuple(e.defines),
     }
@@ -538,8 +541,9 @@ class IsPerfectIteration(Visitor):
         return all(self.visit(i, **kwargs) for i in o)
 
     def visit_Node(self, o, found=False, **kwargs):
-        # Assume all nodes are in a perfect loop if they're in a loop.
-        return found
+        if not found:
+            return False
+        return all(self.visit(i, found=found, **kwargs) for i in o.children)
 
     def visit_Iteration(self, o, found=False, multi=False):
         if found and multi:

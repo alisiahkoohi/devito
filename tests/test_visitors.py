@@ -2,7 +2,7 @@ import cgen as c
 import pytest
 from conftest import skipif_yask
 
-from devito import Eq
+from devito.ir.equations import DummyEq
 from devito.ir.iet import (Block, Expression, Callable, FindSections,
                            FindSymbols, IsPerfectIteration, Transformer,
                            NestedTransformer, printAST)
@@ -10,10 +10,10 @@ from devito.ir.iet import (Block, Expression, Callable, FindSections,
 
 @pytest.fixture(scope="module")
 def exprs(a, b):
-    return [Expression(Eq(a, a + b + 5.)),
-            Expression(Eq(a, b - a)),
-            Expression(Eq(a, 4 * (b * a))),
-            Expression(Eq(a, (6. / b) + (8. * a)))]
+    return [Expression(DummyEq(a, a + b + 5.)),
+            Expression(DummyEq(a, b - a)),
+            Expression(DummyEq(a, 4 * (b * a))),
+            Expression(DummyEq(a, (6. / b) + (8. * a)))]
 
 
 @pytest.fixture(scope="module")
@@ -92,11 +92,11 @@ def test_create_cgen_tree(block1, block2, block3):
     assert str(Callable('foo', block1, 'void', ()).ccode) == """\
 void foo()
 {
-  for (int i = 0; i < 3; i += 1)
+  for (int i = 0; i <= 3; i += 1)
   {
-    for (int j = 0; j < 5; j += 1)
+    for (int j = 0; j <= 5; j += 1)
     {
-      for (int k = 0; k < 7; k += 1)
+      for (int k = 0; k <= 7; k += 1)
       {
         a[i] = a[i] + b[i] + 5.0F;
       }
@@ -106,12 +106,12 @@ void foo()
     assert str(Callable('foo', block2, 'void', ()).ccode) == """\
 void foo()
 {
-  for (int i = 0; i < 3; i += 1)
+  for (int i = 0; i <= 3; i += 1)
   {
     a[i] = a[i] + b[i] + 5.0F;
-    for (int j = 0; j < 5; j += 1)
+    for (int j = 0; j <= 5; j += 1)
     {
-      for (int k = 0; k < 7; k += 1)
+      for (int k = 0; k <= 7; k += 1)
       {
         a[i] = -a[i] + b[i];
       }
@@ -121,21 +121,21 @@ void foo()
     assert str(Callable('foo', block3, 'void', ()).ccode) == """\
 void foo()
 {
-  for (int i = 0; i < 3; i += 1)
+  for (int i = 0; i <= 3; i += 1)
   {
-    for (int s = 0; s < 4; s += 1)
+    for (int s = 0; s <= 4; s += 1)
     {
       a[i] = a[i] + b[i] + 5.0F;
     }
-    for (int j = 0; j < 5; j += 1)
+    for (int j = 0; j <= 5; j += 1)
     {
-      for (int k = 0; k < 7; k += 1)
+      for (int k = 0; k <= 7; k += 1)
       {
         a[i] = -a[i] + b[i];
         a[i] = 4*a[i]*b[i];
       }
     }
-    for (int q = 0; q < 4; q += 1)
+    for (int q = 0; q <= 4; q += 1)
     {
       a[i] = 8.0F*a[i] + 6.0F/b[i];
     }
@@ -225,11 +225,11 @@ def test_transformer_replace_function_body(block1, block2):
     f = Callable('foo', block1, 'void', args)
     assert str(f.ccode) == """void foo(float *restrict a_vec, float *restrict b_vec)
 {
-  for (int i = 0; i < 3; i += 1)
+  for (int i = 0; i <= 3; i += 1)
   {
-    for (int j = 0; j < 5; j += 1)
+    for (int j = 0; j <= 5; j += 1)
     {
-      for (int k = 0; k < 7; k += 1)
+      for (int k = 0; k <= 7; k += 1)
       {
         a[i] = a[i] + b[i] + 5.0F;
       }
@@ -240,12 +240,12 @@ def test_transformer_replace_function_body(block1, block2):
     f = Transformer({block1: block2}).visit(f)
     assert str(f.ccode) == """void foo(float *restrict a_vec, float *restrict b_vec)
 {
-  for (int i = 0; i < 3; i += 1)
+  for (int i = 0; i <= 3; i += 1)
   {
     a[i] = a[i] + b[i] + 5.0F;
-    for (int j = 0; j < 5; j += 1)
+    for (int j = 0; j <= 5; j += 1)
     {
-      for (int k = 0; k < 7; k += 1)
+      for (int k = 0; k <= 7; k += 1)
       {
         a[i] = -a[i] + b[i];
       }

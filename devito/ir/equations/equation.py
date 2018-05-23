@@ -2,10 +2,14 @@ from sympy import Eq
 
 from devito.dimension import SubDimension
 from devito.equation import DOMAIN, INTERIOR
-from devito.ir.support import IterationSpace, Any, compute_intervals, compute_directions
-from devito.symbolics import FrozenExpr, dimension_sort, indexify
+from devito.ir.equations.algorithms import dimension_sort
+from devito.ir.support import (IterationSpace, DataSpace, Interval, IntervalGroup,
+                               Any, Stencil, detect_accesses, detect_oobs, detect_io,
+                               force_directions, detect_free_dimensions,
+                               detect_flow_directions, build_intervals)
+from devito.symbolics import FrozenExpr
 
-__all__ = ['LoweredEq', 'ClusterizedEq', 'IREq']
+__all__ = ['LoweredEq', 'ClusterizedEq', 'DummyEq']
 
 
 class IREq(object):
@@ -23,51 +27,70 @@ class IREq(object):
         return self.lhs.is_Indexed
 
     @property
+    def ispace(self):
+        return self._ispace
+
+    @property
+    def dspace(self):
+        return self._dspace
+
+    @property
     def dimensions(self):
-        return self.ispace.dimensions
+        # Note: some dimensions may be in the iteration space but not in the
+        # data space (e.g., a DerivedDimension); likewise, some dimensions may
+        # be in the data space but not in the iteration space (e.g., when a
+        # function is indexed with integers only)
+        return set(self.dspace.dimensions) | set(self.ispace.dimensions)
+
+    @property
+    def directions(self):
+        return self.ispace.directions
+
+    @property
+    def dtype(self):
+        return self.lhs.dtype
 
 
 class LoweredEq(Eq, IREq):
 
     """
-    LoweredEq(expr, subs=None)
+    LoweredEq(expr)
+    LoweredEq(expr, ispace, dspace, reads, writes)
+    LoweredEq(lhs, rhs, stamp=LoweredEq)
 
-    A SymPy equation with an associated iteration space.
+    A SymPy equation with associated :class:`IterationSpace` and
+    :class:`DataSpace`.
 
-    All :class:`Function` objects within ``expr`` get indexified and thus turned
-    into objects of type :class:`types.Indexed`.
-
-    The iteration space is an object of type :class:`IterationSpace`. It
-    represents the iteration points along each :class:`Dimension` that the
-    equation may traverse with the guarantee that no out-of-bounds accesses
-    will be performed.
+    When created as ``LoweredEq(expr)``, the iteration and data spaces are
+    automatically derived from analysis of ``expr``.
     """
 
     def __new__(cls, *args, **kwargs):
-        # Parse input
         if len(args) == 1:
-            input_expr = args[0]
-            assert type(input_expr) != LoweredEq
-            assert isinstance(input_expr, Eq)
+            # origin: LoweredEq(expr)
+            expr = input_expr = args[0]
+            assert not isinstance(expr, LoweredEq) and isinstance(expr, Eq)
         elif len(args) == 2:
-            # Reconstructing from existing Eq. E.g., we end up here after xreplace
+            # origin: LoweredEq(lhs, rhs, stamp=...)
             stamp = kwargs.pop('stamp')
             expr = Eq.__new__(cls, *args, evaluate=False)
             assert isinstance(stamp, Eq)
             expr.is_Increment = stamp.is_Increment
-            expr.ispace = stamp.ispace
+            expr._ispace, expr._dspace = stamp.ispace, stamp.dspace
+            expr.reads, expr.writes = stamp.reads, stamp.writes
+            return expr
+        elif len(args) == 5:
+            # origin: LoweredEq(expr, ispace, space)
+            input_expr, ispace, dspace, reads, writes = args
+            assert isinstance(ispace, IterationSpace) and isinstance(dspace, DataSpace)
+            expr = Eq.__new__(cls, *input_expr.args, evaluate=False)
+            expr.is_Increment = input_expr.is_Increment
+            expr._ispace, expr._dspace = ispace, dspace
+            expr.reads, expr.writes = reads, writes
             return expr
         else:
             raise ValueError("Cannot construct LoweredEq from args=%s "
                              "and kwargs=%s" % (str(args), str(kwargs)))
-
-        # Indexification
-        expr = indexify(input_expr)
-
-        # Apply caller-provided substitution
-        subs = kwargs.get('subs')
-        if subs is not None:
-            expr = expr.xreplace(subs)
 
         # Well-defined dimension ordering
         ordering = dimension_sort(expr, key=lambda i: not i.is_Time)
@@ -75,21 +98,39 @@ class LoweredEq(Eq, IREq):
         # Introduce space sub-dimensions if need to
         region = getattr(input_expr, '_region', DOMAIN)
         if region == INTERIOR:
-            mapper = {i: SubDimension("%si" % i, i, 1, -1)
+            mapper = {i: SubDimension.middle("%si" % i, i, 1, 1)
                       for i in ordering if i.is_Space}
             expr = expr.xreplace(mapper)
-            ordering = [mapper.get(i, i) for i in ordering]
+            for k, v in mapper.items():
+                ordering.insert(ordering.index(k) + 1, v)
 
-        # Compute iteration space
-        intervals, iterators = compute_intervals(expr)
+        # Analyze the expression
+        mapper = detect_accesses(expr)
+        free_dims = detect_free_dimensions(expr)
+        oobs = detect_oobs(mapper)
+
+        # Derive the stencil
+        stencil = Stencil.union(free_dims, *mapper.values())
+
+        # The iteration space is constructed so that information always flows
+        # from an iteration to another (i.e., no anti-dependences are created)
+        directions, _ = force_directions(detect_flow_directions(expr), lambda i: Any)
+        intervals, iterators = build_intervals(stencil)
         intervals = sorted(intervals, key=lambda i: ordering.index(i.dim))
-        directions, _ = compute_directions(expr, lambda i: Any)
-        ispace = IterationSpace([i.negate() for i in intervals], iterators, directions)
+        ispace = IterationSpace([i.zero() for i in intervals], iterators, directions)
+
+        # The data space is relative to the computational domain
+        intervals = [i if i.dim in oobs else i.zero() for i in intervals]
+        intervals += [Interval(i, 0, 0) for i in ordering if i not in ispace.dimensions]
+        parts = {k: IntervalGroup(build_intervals(v)[0]) for k, v in mapper.items()}
+        dspace = DataSpace(intervals, parts)
 
         # Finally create the LoweredEq with all metadata attached
         expr = super(LoweredEq, cls).__new__(cls, expr.lhs, expr.rhs, evaluate=False)
         expr.is_Increment = getattr(input_expr, 'is_Increment', False)
-        expr.ispace = ispace
+        expr._dspace = dspace
+        expr._ispace = ispace
+        expr.reads, expr.writes = detect_io(expr)
 
         return expr
 
@@ -103,33 +144,66 @@ class LoweredEq(Eq, IREq):
 class ClusterizedEq(Eq, IREq, FrozenExpr):
 
     """
-    ClusterizedEq(expr, ispace)
+    ClusterizedEq(expr, ispace, dspace)
+    ClusterizedEq(lhs, rhs, stamp=ClusterizedEq)
 
-    A SymPy equation carrying its own :class:`IterationSpace`. Suitable for
-    use in a :class:`Cluster`.
+    A SymPy equation with associated :class:`IterationSpace` and
+    :class:`DataSpace`.
 
-    Unlike a :class:`LoweredEq`, a ClusterizedEq is "frozen", meaning that any
-    call to ``xreplace`` will not trigger re-evaluation (e.g., mathematical
-    simplification) of the expression.
+    There are two main differences between a :class:`LoweredEq` and a
+    ClusterizedEq: ::
+
+        * In a ClusterizedEq, the iteration and data spaces must *always*
+          be provided by the caller.
+        * A ClusterizedEq is "frozen", meaning that any call to ``xreplace``
+          will not trigger re-evaluation (e.g., mathematical simplification)
+          of the expression.
+
+    These two properties make a ClusterizedEq suitable for use in a
+    :class:`Cluster`.
     """
 
     def __new__(cls, *args, **kwargs):
-        # Parse input
         if len(args) == 2:
-            maybe_ispace = args[1]
-            if isinstance(maybe_ispace, IterationSpace):
-                input_expr = args[0]
-                expr = Eq.__new__(cls, *input_expr.args, evaluate=False)
-                expr.is_Increment = input_expr.is_Increment
-                expr.ispace = maybe_ispace
-            else:
-                expr = Eq.__new__(cls, *args, evaluate=False)
-                expr.ispace = kwargs['ispace']
-                expr.is_Increment = kwargs.get('is_Increment', False)
+            # origin: ClusterizedEq(lhs, rhs, stamp=...)
+            stamp = kwargs.pop('stamp')
+            assert isinstance(stamp, ClusterizedEq)
+            expr = Eq.__new__(cls, *args, evaluate=False)
+            expr.is_Increment = stamp.is_Increment
+            expr._ispace, expr._dspace = stamp.ispace, stamp.dspace
+        elif len(args) == 3:
+            # origin: ClusterizedEq(expr, ispace, dspace)
+            input_expr, ispace, dspace = args
+            assert isinstance(ispace, IterationSpace) and isinstance(dspace, DataSpace)
+            expr = Eq.__new__(cls, *input_expr.args, evaluate=False)
+            expr.is_Increment = input_expr.is_Increment
+            expr._ispace, expr._dspace = ispace, dspace
         else:
             raise ValueError("Cannot construct ClusterizedEq from args=%s "
                              "and kwargs=%s" % (str(args), str(kwargs)))
         return expr
 
     def func(self, *args, **kwargs):
-        return super(ClusterizedEq, self).func(*args, evaluate=False, ispace=self.ispace)
+        return super(ClusterizedEq, self).func(*args, stamp=self)
+
+
+class DummyEq(ClusterizedEq):
+
+    """
+    DummyEq(expr)
+    DummyEq(lhs, rhs)
+
+    A special :class:`ClusterizedEq` that should never be used except for
+    writing tests, when there is no need to know the iteration/data spaces.
+    """
+
+    def __new__(cls, *args):
+        if len(args) == 1:
+            input_expr = args[0]
+            assert isinstance(input_expr, Eq)
+            obj = LoweredEq(input_expr)
+        elif len(args) == 2:
+            obj = LoweredEq(Eq(*args, evaluate=False))
+        else:
+            raise ValueError("Cannot construct DummyEq from args=%s" % str(args))
+        return ClusterizedEq.__new__(cls, obj, obj.ispace, obj.dspace)

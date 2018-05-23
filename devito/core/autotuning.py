@@ -13,13 +13,14 @@ from devito.parameters import configuration
 __all__ = ['autotune']
 
 
-def autotune(operator, arguments, tunable):
+def autotune(operator, arguments, parameters, tunable):
     """
     Acting as a high-order function, take as input an operator and a list of
     operator arguments to perform empirical autotuning. Some of the operator
     arguments are marked as tunable.
     """
-    at_arguments = arguments.copy()
+    # We get passed all the arguments, but the cfunction only requires a subset
+    at_arguments = OrderedDict([(p.name, arguments[p.name]) for p in parameters])
 
     # User-provided output data must not be altered
     output = [i.name for i in operator.output]
@@ -37,16 +38,16 @@ def autotune(operator, arguments, tunable):
         timesteps = 1
     elif len(steppers) == 1:
         stepper = steppers[0]
-        start = 0
-        timesteps = stepper.extent(start=start, finish=options['at_squeezer'])
+        start = at_arguments[stepper.dim.min_name]
+        timesteps = stepper.extent(start=start, finish=options['at_squeezer']) - 1
         if timesteps < 0:
-            timesteps = options['at_squeezer'] - timesteps + 1
+            timesteps = options['at_squeezer'] - timesteps
             info_at("Adjusted auto-tuning timestep to %d" % timesteps)
-        at_arguments[stepper.dim.start_name] = start
-        at_arguments[stepper.dim.end_name] = timesteps
+        at_arguments[stepper.dim.min_name] = start
+        at_arguments[stepper.dim.max_name] = timesteps
         if stepper.dim.is_Stepping:
-            at_arguments[stepper.dim.parent.start_name] = start
-            at_arguments[stepper.dim.parent.end_name] = timesteps
+            at_arguments[stepper.dim.parent.min_name] = start
+            at_arguments[stepper.dim.parent.max_name] = timesteps
     else:
         info_at("Couldn't understand loop structure, giving up auto-tuning")
         return arguments
@@ -56,10 +57,9 @@ def autotune(operator, arguments, tunable):
     # ... Defaults (basic mode)
     blocksizes = [OrderedDict([(i, v) for i in mapper]) for v in options['at_blocksize']]
     # ... Always try the entire iteration space (degenerate block)
-    datashape = [at_arguments[mapper[i].original_dim.symbolic_end.name] -
-                 at_arguments[mapper[i].original_dim.symbolic_start.name] for i in mapper]
-    blocksizes.append(OrderedDict([(i, mapper[i].iteration.extent(0, j))
-                      for i, j in zip(mapper, datashape)]))
+    itershape = [mapper[i].iteration.symbolic_extent.subs(arguments) for i in mapper]
+    blocksizes.append(OrderedDict([(i, mapper[i].iteration.extent(0, j-1))
+                      for i, j in zip(mapper, itershape)]))
     # ... More attempts if auto-tuning in aggressive mode
     if configuration.core['autotuning'] == 'aggressive':
         blocksizes = more_heuristic_attempts(blocksizes)
@@ -68,8 +68,8 @@ def autotune(operator, arguments, tunable):
     # Will drop block sizes that might lead to a stack overflow
     functions = FindSymbols('symbolics').visit(operator.body +
                                                operator.elemental_functions)
-    stack_shapes = [i.shape for i in functions if i.is_Array and i._mem_stack]
-    stack_space = sum(reduce(mul, i, 1) for i in stack_shapes)*operator.dtype().itemsize
+    stack_shapes = [i.symbolic_shape for i in functions if i.is_Array and i._mem_stack]
+    stack_space = sum(reduce(mul, i, 1) for i in stack_shapes)*operator._dtype().itemsize
 
     # Note: there is only a single loop over 'blocksize' because only
     # square blocks are tested
@@ -79,8 +79,9 @@ def autotune(operator, arguments, tunable):
         for k, v in at_arguments.items():
             if k in bs:
                 val = bs[k]
-                start = at_arguments[mapper[k].original_dim.symbolic_start.name]
-                end = at_arguments[mapper[k].original_dim.symbolic_end.name]
+                start = mapper[k].original_dim.symbolic_start.subs(arguments)
+                end = mapper[k].original_dim.symbolic_end.subs(arguments)
+
                 if val <= mapper[k].iteration.extent(start, end):
                     at_arguments[k] = val
                 else:
@@ -168,7 +169,7 @@ def more_heuristic_attempts(blocksizes):
 
 
 options = {
-    'at_squeezer': 5,
+    'at_squeezer': 4,
     'at_blocksize': sorted({8, 16, 24, 32, 40, 64, 128}),
     'at_stack_limit': resource.getrlimit(resource.RLIMIT_STACK)[0] / 4
 }

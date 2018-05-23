@@ -1,15 +1,16 @@
-from collections import Iterable, OrderedDict
+from collections import Iterable, OrderedDict, namedtuple
 
 import sympy
-from sympy import Number, Indexed, Function, Symbol
+from sympy import Number, Indexed, Symbol, LM, LC
 
-from devito.symbolics.extended_sympy import Add, Mul, Eq
+from devito.symbolics.extended_sympy import Add, Mul, Eq, FrozenExpr
 from devito.symbolics.search import retrieve_indexed, retrieve_functions
 from devito.dimension import Dimension
 from devito.tools import as_tuple, flatten
+from devito.types import Symbol as dSymbol
 
 __all__ = ['freeze_expression', 'xreplace_constrained', 'xreplace_indices',
-           'pow_to_mul', 'as_symbol', 'indexify']
+           'pow_to_mul', 'as_symbol', 'indexify', 'convert_to_SSA', 'split_affine']
 
 
 def freeze_expression(expr):
@@ -27,7 +28,11 @@ def freeze_expression(expr):
         return Mul(*rebuilt_args, evaluate=False)
     elif expr.is_Equality:
         rebuilt_args = [freeze_expression(e) for e in expr.args]
-        return Eq(*rebuilt_args, evaluate=False)
+        if isinstance(expr, FrozenExpr):
+            # Avoid dropping metadata associated with /expr/
+            return expr.func(*rebuilt_args)
+        else:
+            return Eq(*rebuilt_args, evaluate=False)
     else:
         return expr.func(*[freeze_expression(e) for e in expr.args])
 
@@ -50,9 +55,8 @@ def xreplace_constrained(exprs, make, rule=None, costmodel=lambda e: True, repea
 
     :param exprs: The target SymPy expression, or a collection of SymPy expressions.
     :param make: Either a mapper M: K -> V, indicating how to replace an expression
-                 in K with a symbol in V, or a function, used to construct new, unique
-                 symbols. Such a function should take as input a parameter, used to
-                 enumerate the new symbols.
+                 in K with a symbol in V, or a function with internal state that,
+                 when called, returns unique symbols.
     :param rule: The matching rule (a lambda function). May be left unspecified if
                  ``make`` is a mapper.
     :param costmodel: The cost model (a lambda function, optional).
@@ -71,14 +75,10 @@ def xreplace_constrained(exprs, make, rule=None, costmodel=lambda e: True, repea
 
         def replace(expr):
             temporary = found.get(expr)
-            if temporary:
-                return temporary
-            else:
-                temporary = make(replace.c)
+            if not temporary:
+                temporary = make()
                 found[expr] = temporary
-                replace.c += 1
-                return temporary
-        replace.c = 0  # Unique identifier for new temporaries
+            return temporary
 
     def run(expr):
         if expr.is_Atom or expr.is_Indexed:
@@ -177,10 +177,26 @@ def as_symbol(expr):
         return expr
     elif isinstance(expr, Indexed):
         return expr.base.label
-    elif isinstance(expr, Function):
-        return Symbol(expr.__class__.__name__)
     else:
         raise TypeError("Cannot extract symbol from type %s" % type(expr))
+
+
+def split_affine(expr):
+    """
+    split_affine(expr)
+
+    Split an affine scalar function into its three components, namely variable,
+    coefficient, and translation from origin.
+
+    :raises ValueError: If ``expr`` is non affine.
+    """
+    AffineFunction = namedtuple("AffineFunction", "var, coeff, shift")
+    if expr.is_Number:
+        return AffineFunction(None, None, expr)
+    poly = expr.as_poly()
+    if not (poly.is_univariate and poly.is_linear) or not LM(poly).is_Symbol:
+        raise ValueError
+    return AffineFunction(LM(poly), LC(poly), poly.TC())
 
 
 def indexify(expr):
@@ -197,3 +213,31 @@ def indexify(expr):
         except AttributeError:
             pass
     return expr.xreplace(mapper)
+
+
+def convert_to_SSA(exprs):
+    """
+    Convert an iterable of :class:`Eq`s into Static Single Assignment form.
+    """
+    # Identify recurring LHSs
+    seen = {}
+    for i, e in enumerate(exprs):
+        seen.setdefault(e.lhs, []).append(i)
+    # Optimization: don't waste time reconstructing stuff if already in SSA form
+    if all(len(i) == 1 for i in seen.values()):
+        return exprs
+    # Do the SSA conversion
+    c = 0
+    mapper = {}
+    processed = []
+    for i, e in enumerate(exprs):
+        where = seen[e.lhs]
+        if len(where) > 1 and where[-1] != i:
+            # LHS needs SSA form
+            ssa_lhs = dSymbol(name='ssa_t%d' % c, dtype=e.lhs.base.function.dtype)
+            processed.append(e.func(ssa_lhs, e.rhs.xreplace(mapper)))
+            mapper[e.lhs] = ssa_lhs
+            c += 1
+        else:
+            processed.append(e.func(e.lhs, e.rhs.xreplace(mapper)))
+    return processed

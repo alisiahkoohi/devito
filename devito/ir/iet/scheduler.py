@@ -5,23 +5,24 @@ import numpy as np
 from devito.cgen_utils import Allocator
 from devito.dimension import LoweredDimension
 from devito.ir.iet import (Expression, LocalExpression, Element, Iteration, List,
-                           Conditional, UnboundedIndex, MetaCall, MapExpressions,
-                           Transformer, NestedTransformer, SubstituteExpression,
-                           iet_analyze, filter_iterations, retrieve_iteration_tree)
+                           Conditional, Section, ExpressionBundle, UnboundedIndex,
+                           MetaCall, MapExpressions, Transformer, NestedTransformer,
+                           SubstituteExpression, iet_analyze, filter_iterations,
+                           retrieve_iteration_tree)
 from devito.tools import filter_ordered, flatten
 from devito.types import Scalar
 
 __all__ = ['iet_build', 'iet_insert_C_decls']
 
 
-def iet_build(clusters, dtype):
+def iet_build(stree):
     """
-    Create an Iteration/Expression tree (IET) given an iterable of :class:`Cluster`s.
+    Create an Iteration/Expression tree (IET) from a :class:`ScheduleTree`.
     The nodes in the returned IET are decorated with properties deriving from
     data dependence analysis.
     """
-    # Clusters -> Iteration/Expression tree
-    iet = iet_make(clusters, dtype)
+    # Schedule tree -> Iteration/Expression tree
+    iet = iet_make(stree)
 
     # Data dependency analysis. Properties are attached directly to nodes
     iet = iet_analyze(iet)
@@ -38,91 +39,48 @@ def iet_build(clusters, dtype):
     return iet
 
 
-def iet_make(clusters, dtype):
+def iet_make(stree):
     """
-    Create an Iteration/Expression tree (IET) given an iterable of :class:`Cluster`s.
-
-    :param clusters: The iterable :class:`Cluster`s for which the IET is built.
-    :param dtype: The data type of the scalar expressions.
+    Create an Iteration/Expression tree (IET) from a :class:`ScheduleTree`.
     """
-    processed = []
-    schedule = OrderedDict()
-    for cluster in clusters:
-        if not cluster.ispace.empty:
-            root = None
-            intervals = cluster.ispace.intervals
+    nsections = 0
+    queues = OrderedDict()
+    for i in stree.visit():
+        if i == stree:
+            # We hit this handle at the very end of the visit
+            return List(body=queues.pop(i))
 
-            # Can I reuse any of the previously scheduled Iterations ?
-            index = 0
-            for i0, i1 in zip(intervals, list(schedule)):
-                if i0 != i1 or i0.dim in cluster.atomics:
-                    break
-                root = schedule[i1]
-                index += 1
-            needed = intervals[index:]
+        elif i.is_Exprs:
+            exprs = [Expression(e) for e in i.exprs]
+            body = [ExpressionBundle(i.shape, i.ops, i.traffic, body=exprs)]
 
-            # Build Expressions
-            body = [Expression(e, np.int32 if cluster.trace.is_index(e.lhs) else dtype)
-                    for e in cluster.exprs]
-            if not needed:
-                body = List(body=body)
+        elif i.is_Conditional:
+            body = [Conditional(i.guard, queues.pop(i))]
 
-            # Build Iterations
-            scheduling = []
-            for i in reversed(needed):
-                # Prepare any necessary unbounded index
-                uindices = []
-                for j, offs in cluster.ispace.sub_iterators.get(i.dim, []):
-                    modulo = len(offs)
-                    for n, o in enumerate(filter_ordered(offs)):
-                        name = "%s%d" % (j.name, n)
-                        vname = Scalar(name=name, dtype=np.int32)
-                        value = (i.dim + o) % modulo
-                        uindices.append(UnboundedIndex(vname, value, value, j, j + o))
+        elif i.is_Iteration:
+            # Generate `uindices`
+            uindices = []
+            for d, offs in i.sub_iterators:
+                if not d.is_Stepping:
+                    # Apart from SteppingDimension, no other type of Dimension
+                    # requires generation of uindices
+                    continue
+                modulo = len(offs)
+                for n, o in enumerate(filter_ordered(offs)):
+                    value = (i.dim + o) % modulo
+                    symbol = Scalar(name="%s%d" % (d.name, n), dtype=np.int32)
+                    uindices.append(UnboundedIndex(symbol, value, value, d, d + o))
+            # Generate Iteration
+            body = [Iteration(queues.pop(i), i.dim, i.dim.limits, offsets=i.limits,
+                              direction=i.direction, uindices=uindices)]
 
-                # Retrieve the iteration direction
-                direction = cluster.ispace.directions[i.dim]
+        elif i.is_Section:
+            body = [Section('section%d' % nsections, body=queues.pop(i))]
+            nsections += 1
 
-                # Update IET and scheduling
-                if i.dim in cluster.guards:
-                    # Must wrap within an if-then scope
-                    body = Conditional(cluster.guards[i.dim], body)
-                    iteration = Iteration(body, i.dim, i.dim.limits, offsets=i.limits,
-                                          direction=direction, uindices=uindices)
-                    # Adding (None, None) ensures that nested iterations won't
-                    # be reused by the next cluster
-                    scheduling.extend([(None, None), (i, iteration)])
-                else:
-                    iteration = Iteration(body, i.dim, i.dim.limits, offsets=i.limits,
-                                          direction=direction, uindices=uindices)
-                    scheduling.append((i, iteration))
+        queues.setdefault(i.parent, []).extend(body)
 
-                # Prepare for next dimension
-                body = iteration
-
-            # If /needed/ is != [], root.dim might be a guarded dimension for /cluster/
-            if root is not None and root.dim in cluster.guards:
-                body = Conditional(cluster.guards[root.dim], body)
-
-            # Update the current schedule
-            scheduling = OrderedDict(reversed(scheduling))
-            if root is None:
-                processed.append(body)
-                schedule = scheduling
-            else:
-                nodes = list(root.nodes) + [body]
-                mapper = {root: root._rebuild(nodes, **root.args_frozen)}
-                transformer = Transformer(mapper)
-                processed = list(transformer.visit(processed))
-                schedule = OrderedDict(list(schedule.items())[:index] +
-                                       list(scheduling.items()))
-                for k, v in list(schedule.items()):
-                    schedule[k] = transformer.rebuilt.get(v, v)
-        else:
-            # No Iterations are needed
-            processed.extend([Expression(e, dtype) for e in cluster.exprs])
-
-    return List(body=processed)
+    assert False
 
 
 def iet_insert_C_decls(iet, func_table):
@@ -153,11 +111,11 @@ def iet_insert_C_decls(iet, func_table):
         if k.is_scalar:
             # Inline declaration
             mapper[k] = LocalExpression(**k.args)
-        elif k.write._mem_external:
-            # Nothing to do, variable passed as kernel argument
+        elif k.write is None or k.write._mem_external:
+            # Nothing to do, e.g., variable passed as kernel argument
             continue
         elif k.write._mem_stack:
-            # On the stack, as established by the DLE
+            # On the stack
             key = lambda i: not i.is_Parallel
             site = filter_iterations(v, key=key, stop='asap') or [iet]
             allocator.push_stack(site[-1], k.write)

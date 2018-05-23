@@ -2,10 +2,10 @@ from __future__ import absolute_import
 
 from devito.ir.clusters import ClusterGroup, groupby
 from devito.dse.backends import (BasicRewriter, AdvancedRewriter, SpeculativeRewriter,
-                                 AggressiveRewriter, CustomRewriter)
-from devito.exceptions import DSEException
+                                 AggressiveRewriter)
 from devito.logger import dse_warning
 from devito.parameters import configuration
+from devito.tools import flatten
 
 __all__ = ['rewrite']
 
@@ -36,11 +36,11 @@ def rewrite(clusters, mode='advanced'):
          * 'basic': Apply common sub-expressions elimination.
          * 'advanced': Apply all transformations that will reduce the
                        operation count w/ minimum increase to the memory pressure,
-                       namely 'basic', factorization, CSRE for time-invariants only.
-         * 'speculative': Like 'advanced', but apply CSRE also to time-varying
+                       namely 'basic', factorization, CIRE for time-invariants only.
+         * 'speculative': Like 'advanced', but apply CIRE also to time-varying
                           sub-expressions, which might further increase the memory
                           pressure.
-         * 'aggressive': Like 'speculative', but apply CSRE to any non-trivial
+         * 'aggressive': Like 'speculative', but apply CIRE to any non-trivial
                          sub-expression (i.e., anything that is at least in a
                          sum-of-products form). This may substantially increase
                          the memory pressure.
@@ -50,22 +50,19 @@ def rewrite(clusters, mode='advanced'):
 
     if mode is None or mode == 'noop':
         return clusters
+    elif mode not in modes:
+        dse_warning("Unknown rewrite mode(s) %s" % mode)
+        return clusters
 
-    processed = ClusterGroup()
-    for cluster in clusters:
-        if cluster.is_dense:
-            if mode in modes:
-                processed.extend(modes[mode]().run(cluster))
-            else:
-                try:
-                    processed.extend(CustomRewriter().run(cluster))
-                except DSEException:
-                    dse_warning("Unknown rewrite mode(s) %s" % mode)
-                    processed.append(cluster)
-        else:
-            # Downgrade sparse clusters to basic rewrite mode since it's
-            # pointless to expose loop-redundancies when the iteration space
-            # only consists of a few points
-            processed.extend(BasicRewriter(False).run(cluster))
+    # Separate rewriters for dense and sparse clusters; sparse clusters have
+    # non-affine index functions, thus making it basically impossible, in general,
+    # to apply the more advanced DSE passes.
+    # Note: the sparse rewriter uses the same template for temporaries as
+    # the dense rewriter, thus temporaries are globally unique
+    rewriter = modes[mode]()
+    fallback = BasicRewriter(False, rewriter.template)
+
+    processed = ClusterGroup(flatten(rewriter.run(c) if c.is_dense else fallback.run(c)
+                                     for c in clusters))
 
     return groupby(processed).finalize()

@@ -2,10 +2,11 @@ import sympy
 import numpy as np
 from cached_property import cached_property
 
+from devito.exceptions import InvalidArgument
 from devito.types import AbstractSymbol, Scalar, Symbol
 
-__all__ = ['Dimension', 'SpaceDimension', 'TimeDimension', 'SteppingDimension',
-           'SubDimension', 'ConditionalDimension']
+__all__ = ['Dimension', 'SpaceDimension', 'TimeDimension', 'DefaultDimension',
+           'SteppingDimension', 'SubDimension', 'ConditionalDimension', 'dimensions']
 
 
 class Dimension(AbstractSymbol):
@@ -14,6 +15,7 @@ class Dimension(AbstractSymbol):
     is_Space = False
     is_Time = False
 
+    is_Default = False
     is_Derived = False
     is_NonlinearDerived = False
     is_Sub = False
@@ -23,7 +25,7 @@ class Dimension(AbstractSymbol):
     is_Lowered = False
 
     """
-    Index object that represents a problem dimension and thus defines a
+    A Dimension is a symbol representing a problem dimension and thus defining a
     potential iteration space.
 
     :param name: Name of the dimension symbol.
@@ -53,20 +55,14 @@ class Dimension(AbstractSymbol):
         """
         The symbol defining the iteration start for this dimension.
         """
-        return Scalar(name=self.start_name, dtype=np.int32)
+        return Scalar(name=self.min_name, dtype=np.int32)
 
     @cached_property
     def symbolic_end(self):
         """
         The symbol defining the iteration end for this dimension.
         """
-        return Scalar(name=self.end_name, dtype=np.int32)
-
-    @property
-    def symbolic_extent(self):
-        """Return the extent of the loop over this dimension.
-        Would be the same as size if using default values """
-        return (self.symbolic_end - self.symbolic_start)
+        return Scalar(name=self.max_name, dtype=np.int32)
 
     @property
     def limits(self):
@@ -77,12 +73,16 @@ class Dimension(AbstractSymbol):
         return "%s_size" % self.name
 
     @property
-    def start_name(self):
-        return "%s_s" % self.name
+    def ext_name(self):
+        return "%s_n" % self.name
 
     @property
-    def end_name(self):
-        return "%s_e" % self.name
+    def min_name(self):
+        return "%s_m" % self.name
+
+    @property
+    def max_name(self):
+        return "%s_M" % self.name
 
     @property
     def spacing(self):
@@ -95,33 +95,95 @@ class Dimension(AbstractSymbol):
     def _hashable_content(self):
         return super(Dimension, self)._hashable_content() + (self.spacing,)
 
-    def argument_defaults(self, size=None):
-        """
-        Returns a map of default argument values defined by this symbol.
+    @property
+    def _defines(self):
+        return {self}
 
-        :param size: Optional, known size as provided by data-carrying symbols
-        """
-        return {self.start_name: 0, self.end_name: size, self.size_name: size}
+    @property
+    def _arg_names(self):
+        """Return a tuple of argument names introduced by this dimension."""
+        return (self.name, self.size_name, self.ext_name, self.max_name, self.min_name)
 
-    def argument_values(self, **kwargs):
+    def _arg_defaults(self, start=None, size=None, alias=None):
         """
-        Returns a map of argument values after evaluating user input.
+        Returns a map of default argument values defined by this dimension.
 
+        :param start: (Optional) known starting point as provided by
+                      data-carrying symbols.
+        :param size: (Optional) known size as provided by data-carrying symbols.
+        :param alias: (Optional) name under which to store values.
+        """
+        dim = alias or self
+        return {dim.min_name: start or 0, dim.max_name: size, dim.size_name: size}
+
+    def _arg_values(self, args, interval, **kwargs):
+        """
+        Returns a map of argument values after evaluating user input. If no
+        user input is provided, get a known value in ``args`` and adjust it
+        so that no out-of-bounds memory accesses will be performeed. The
+        adjustment exploits the information in ``interval``, a :class:`Interval`
+        describing the data space of this dimension. If there is no known value
+        in ``args``, use a default value.
+
+        :param args: Dictionary of known argument values.
+        :param interval: A :class:`Interval` for ``self``.
         :param kwargs: Dictionary of user-provided argument overrides.
         """
+        defaults = self._arg_defaults()
         values = {}
 
-        if self.start_name in kwargs:
-            values[self.start_name] = kwargs.pop(self.start_name)
+        # Min value
+        if self.min_name in kwargs:
+            # User-override
+            values[self.min_name] = kwargs.pop(self.min_name)
+        else:
+            # Adjust known/default value to avoid OOB accesses
+            values[self.min_name] = args.get(self.min_name, defaults[self.min_name])
+            try:
+                values[self.min_name] -= min(interval.lower, 0)
+            except (AttributeError, TypeError):
+                pass
 
-        if self.end_name in kwargs:
-            values[self.end_name] = kwargs.pop(self.end_name)
-
-        # Let the dimension name be an alias for `dim_e`
-        if self.name in kwargs:
-            values[self.end_name] = kwargs.pop(self.name)
+        # Max value
+        if self.max_name in kwargs:
+            # User-override
+            values[self.max_name] = kwargs.pop(self.max_name)
+        elif self.name in kwargs:
+            # Let `dim.name` to be an alias for `dim.max_name`
+            values[self.max_name] = kwargs.pop(self.name)
+        elif self.ext_name in kwargs:
+            # Extent is used to derive max value
+            values[self.max_name] = values[self.min_name] + kwargs[self.ext_name] - 1
+        else:
+            # Adjust known/default value to avoid OOB accesses
+            values[self.max_name] = args.get(self.max_name, defaults[self.max_name])
+            try:
+                values[self.max_name] -= (1 + max(interval.upper, 0))
+            except (AttributeError, TypeError):
+                pass
 
         return values
+
+    def _arg_check(self, args, size, interval):
+        """
+        :raises InvalidArgument: If any of the ``self``-related runtime arguments
+                                 in ``args`` will cause an out-of-bounds access.
+        """
+        if self.min_name not in args:
+            raise InvalidArgument("No runtime value for %s" % self.min_name)
+        if interval.is_Defined and args[self.min_name] + interval.lower < 0:
+            raise InvalidArgument("OOB detected due to %s=%d" % (self.min_name,
+                                                                 args[self.min_name]))
+
+        if self.max_name not in args:
+            raise InvalidArgument("No runtime value for %s" % self.max_name)
+        if interval.is_Defined and args[self.max_name] + interval.upper >= size:
+            raise InvalidArgument("OOB detected due to %s=%d" % (self.max_name,
+                                                                 args[self.max_name]))
+
+        if args[self.max_name] < args[self.min_name]:
+            raise InvalidArgument("Illegal max=%s < min=%s"
+                                  % (args[self.max_name], args[self.min_name]))
 
 
 class SpaceDimension(Dimension):
@@ -153,6 +215,26 @@ class TimeDimension(Dimension):
     """
 
 
+class DefaultDimension(Dimension):
+
+    is_Default = True
+
+    """
+    Dimension symbol to represent a dimension that has a statically-known size.
+    """
+
+    def __new__(cls, name, **kwargs):
+        newobj = sympy.Symbol.__new__(cls, name)
+        newobj._spacing = kwargs.get('spacing', Scalar(name='h_%s' % name))
+        newobj._default_value = kwargs.get('default_value', None)
+        return newobj
+
+    def _arg_defaults(self, start=None, size=None, alias=None):
+        dim = alias or self
+        size = size or dim._default_value
+        return {dim.min_name: start or 0, dim.max_name: size, dim.size_name: size}
+
+
 class DerivedDimension(Dimension):
 
     is_Derived = True
@@ -161,7 +243,7 @@ class DerivedDimension(Dimension):
     Dimension symbol derived from a ``parent`` Dimension.
 
     :param name: Name of the dimension symbol.
-    :param parent: Parent dimension from which the ``SubDimension`` is
+    :param parent: Parent dimension from which the ``DerivedDimension`` is
                    created.
     """
 
@@ -183,7 +265,21 @@ class DerivedDimension(Dimension):
         return self.parent.spacing
 
     def _hashable_content(self):
-        return (self.parent._hashable_content(),)
+        return (self.name, self.parent._hashable_content())
+
+    @property
+    def _defines(self):
+        return {self} | self.parent._defines
+
+    @property
+    def _arg_names(self):
+        return self.parent._arg_names
+
+    def _arg_check(self, *args):
+        """
+        A :class:`DerivedDimension` performs no runtime checks.
+        """
+        return
 
 
 class SubDimension(DerivedDimension):
@@ -196,46 +292,86 @@ class SubDimension(DerivedDimension):
 
     :param name: Name of the dimension symbol.
     :param parent: Parent dimension from which the SubDimension is created.
-    :param lower: Lower offset from the ``parent`` dimension.
-    :param upper: Upper offset from the ``parent`` dimension.
+    :param lower: Symbolic expression to provide the lower bound
+    :param upper: Symbolic expression to provide the upper bound
     """
 
-    def __new__(cls, name, parent, lower, upper, **kwargs):
+    def __new__(cls, name, parent, lower, upper, size, **kwargs):
         newobj = DerivedDimension.__new__(cls, name, parent, **kwargs)
-        newobj._lower = lower
-        newobj._upper = upper
+        newobj._interval = sympy.Interval(lower, upper)
+        newobj._size = size
         return newobj
 
-    @property
-    def lower(self):
-        return self._lower
+    @classmethod
+    def left(cls, name, parent, thickness):
+        return cls(name, parent,
+                   lower=parent.symbolic_start,
+                   upper=parent.symbolic_start+thickness-1,
+                   size=thickness)
+
+    @classmethod
+    def right(cls, name, parent, thickness):
+        return cls(name, parent,
+                   lower=parent.symbolic_end-thickness+1,
+                   upper=parent.symbolic_end,
+                   size=thickness)
+
+    @classmethod
+    def middle(cls, name, parent, thickness_left, thickness_right):
+        return cls(name, parent,
+                   lower=parent.symbolic_start+thickness_left,
+                   upper=parent.symbolic_end-thickness_right,
+                   size=parent.symbolic_size-thickness_left-thickness_right)
 
     @property
-    def upper(self):
-        return self._upper
+    def symbolic_start(self):
+        return self._interval.left
+
+    @property
+    def symbolic_end(self):
+        return self._interval.right
+
+    @property
+    def symbolic_size(self):
+        return self._size
+
+    def offset_lower(self):
+        # The lower extreme of the subdimension can be related to either the
+        # start or end of the parent dimension
+        try:
+            val = self.symbolic_start - self.parent.symbolic_start
+            return int(val), self.parent.symbolic_start
+        except TypeError:
+            val = self.symbolic_start - self.parent.symbolic_end
+            return int(val), self.parent.symbolic_end
+
+    def offset_upper(self):
+        # The upper extreme of the subdimension can be related to either the
+        # start or end of the parent dimension
+        try:
+            val = self.symbolic_end - self.parent.symbolic_start
+            return int(val), self.parent.symbolic_start
+        except TypeError:
+            val = self.symbolic_end - self.parent.symbolic_end
+            return int(val), self.parent.symbolic_end
 
     def _hashable_content(self):
-        return (self.parent._hashable_content(), self.lower, self.upper)
+        return super(SubDimension, self)._hashable_content() + (self._interval,
+                                                                self._size)
 
-    def argument_defaults(self, parent_defaults):
+    def _arg_defaults(self, **kwargs):
         """
-        Returns a map of default argument values defined by this symbol.
-
-        :param parent_defaults: Default values for the parent dimensions.
+        A :class:`SubDimension` provides no arguments, so this method returns
+        an empty dict.
         """
-        args = {}
+        return {}
 
-        if self.parent.start_name in parent_defaults:
-            args[self.start_name] = parent_defaults[self.parent.start_name] + self.lower
-
-        if self.parent.end_name in parent_defaults:
-            args[self.end_name] = parent_defaults[self.parent.end_name] + self.upper
-
-        if self.parent.size_name in parent_defaults:
-            args[self.size_name] = parent_defaults[self.parent.size_name] -\
-                (self.lower + self.upper)
-
-        return args
+    def _arg_values(self, *args, **kwargs):
+        """
+        A :class:`SubDimension` provides no arguments, so there are
+        no argument values to be derived.
+        """
+        return {}
 
 
 class ConditionalDimension(DerivedDimension):
@@ -253,6 +389,17 @@ class ConditionalDimension(DerivedDimension):
         * ``condition``: an arbitrary SymPy expression depending on ``parent``.
                          All iterations for which the expression evaluates to
                          True are part of the ``SubDimension`` region.
+
+    ConditionalDimension needs runtime arguments. The generated C code will require
+    the size of the dimension to initialize the arrays as e.g:
+
+        .. code-block:: python
+           x = grid.dimension[0]
+           x1 = ConditionalDimension(name='x1', parent=x, factor=2)
+           u1 = TimeFunction(name='u1', dimensions=(x1,), size=grid.shape[0]/factor)
+           # The generated code will look like
+           float (*restrict u1)[x1_size + 1] =
+
     """
 
     def __new__(cls, name, parent, **kwargs):
@@ -260,6 +407,10 @@ class ConditionalDimension(DerivedDimension):
         newobj._factor = kwargs.get('factor')
         newobj._condition = kwargs.get('condition')
         return newobj
+
+    @property
+    def spacing(self):
+        return self.factor * self.parent.spacing
 
     @property
     def factor(self):
@@ -270,7 +421,8 @@ class ConditionalDimension(DerivedDimension):
         return self._condition
 
     def _hashable_content(self):
-        return (self.parent._hashable_content(), self.factor, self.condition)
+        return super(ConditionalDimension, self)._hashable_content() + (self.factor,
+                                                                        self.condition)
 
 
 class SteppingDimension(DerivedDimension):
@@ -311,36 +463,40 @@ class SteppingDimension(DerivedDimension):
         """
         return self.parent.symbolic_end
 
-    def argument_defaults(self, size=None):
-        """
-        Returns a map of default argument values defined by this symbol.
+    @property
+    def _arg_names(self):
+        return (self.min_name, self.max_name, self.name) + self.parent._arg_names
 
-        :param size: Optional, known size as provided by data-carrying symbols
+    def _arg_defaults(self, start=None, **kwargs):
+        """
+        Returns a map of default argument values defined by this dimension.
+
+        :param start: Optional, known starting point as provided by
+                      data-carrying symbols.
 
         note ::
 
         A :class:`SteppingDimension` neither knows its size nor its
         iteration end point. So all we can provide is a starting point.
         """
-        return {self.parent.start_name: 0}
+        return {self.parent.min_name: start}
 
-    def argument_values(self, **kwargs):
+    def _arg_values(self, *args, **kwargs):
         """
-        Returns a map of argument values after evaluating user input.
-
-        :param kwargs: Dictionary of user-provided argument overrides.
+        The argument values provided by a :class:`SteppingDimension` are those
+        of its parent, as it acts as an alias.
         """
-        values = self.parent.argument_values(**kwargs)
+        values = {}
 
-        if self.start_name in kwargs:
-            values[self.parent.start_name] = kwargs.pop(self.start_name)
+        if self.min_name in kwargs:
+            values[self.parent.min_name] = kwargs.pop(self.min_name)
 
-        if self.end_name in kwargs:
-            values[self.parent.end_name] = kwargs.pop(self.end_name)
+        if self.max_name in kwargs:
+            values[self.parent.max_name] = kwargs.pop(self.max_name)
 
         # Let the dimension name be an alias for `dim_e`
         if self.name in kwargs:
-            values[self.parent.end_name] = kwargs.pop(self.name)
+            values[self.parent.max_name] = kwargs.pop(self.name)
 
         return values
 
@@ -367,3 +523,13 @@ class LoweredDimension(Dimension):
 
     def _hashable_content(self):
         return Symbol._hashable_content(self) + (self.origin,)
+
+
+def dimensions(names):
+    """
+    Shortcut for: ::
+
+        dimensions('i j k') -> [Dimension('i'), Dimension('j'), Dimension('k')]
+    """
+    assert type(names) == str
+    return tuple(Dimension(i) for i in names.split())
