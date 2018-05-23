@@ -65,9 +65,9 @@ class AcousticWaveSolver(object):
                                 space_order=self.space_order, **self._kwargs)
 
     @memoized_meth
-    def op_born(self):
+    def op_born(self, save=False):
         """Cached operator for born runs"""
-        return BornOperator(self.model, save=None, source=self.source,
+        return BornOperator(self.model, save=save, source=self.source,
                             receiver=self.receiver, kernel=self.kernel,
                             space_order=self.space_order, **self._kwargs)
 
@@ -189,7 +189,7 @@ class AcousticWaveSolver(object):
                                            dt=dt, **kwargs)
         return grad, summary
 
-    def born(self, dmin, src=None, rec=None, u=None, U=None, m=None, **kwargs):
+    def born(self, dmin, src=None, rec=None, u=None, U=None, m=None, save=False, **kwargs):
         """
         Linearized Born modelling function that creates the necessary
         data objects for running an adjoint modelling operator.
@@ -212,6 +212,7 @@ class AcousticWaveSolver(object):
         # Create the forward wavefields u and U if not provided
         if u is None:
             u = TimeFunction(name='u', grid=self.model.grid,
+                             save=self.source.nt if save else None,
                              time_order=2, space_order=self.space_order)
         if U is None:
             U = TimeFunction(name='U', grid=self.model.grid,
@@ -222,6 +223,6 @@ class AcousticWaveSolver(object):
             m = self.model.m
 
         # Execute operator and return wavefield and receiver data
-        summary = self.op_born().apply(dm=dmin, u=u, U=U, src=src, rec=rec,
-                                       m=m, dt=kwargs.pop('dt', self.dt), **kwargs)
+        summary = self.op_born(save).apply(dm=dmin, u=u, U=U, src=src, rec=rec,
+                                           m=m, dt=kwargs.pop('dt', self.dt), **kwargs)
         return rec, u, U, summary

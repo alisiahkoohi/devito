@@ -166,7 +166,7 @@ def GradientOperator(model, source, receiver, space_order=4, save=True,
 
 
 def BornOperator(model, source, receiver, space_order=4,
-                 kernel='OT2', **kwargs):
+                 kernel='OT2', save=False, **kwargs):
     """
     Constructor method for the Linearized Born operator in an acoustic media
 
@@ -185,7 +185,7 @@ def BornOperator(model, source, receiver, space_order=4,
                    npoint=receiver.npoint)
 
     # Create wavefields and a dm field
-    u = TimeFunction(name="u", grid=model.grid, save=None,
+    u = TimeFunction(name="u", grid=model.grid, save=source.nt if save else None,
                      time_order=2, space_order=space_order)
     U = TimeFunction(name="U", grid=model.grid, save=None,
                      time_order=2, space_order=space_order)
