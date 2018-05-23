@@ -1,6 +1,7 @@
 from sympy import solve, Symbol
 
 from devito import Eq, Operator, Function, TimeFunction
+from devito.cgen_utils import INT
 from devito.logger import error
 from examples.seismic import PointSource, Receiver
 
@@ -83,14 +84,16 @@ def ForwardOperator(model, source, receiver, space_order=4,
 
     # Create interpolation expression for receivers
     rec_term = rec.interpolate(expr=u, offset=model.nbpml)
-
+    if kwargs.get('freesurface', False):
+        eqn += [Eq(u.forward.subs({u.indices[-1] : INT(i)}), -u.forward.subs({u.indices[-1] : INT(2*model.nbpml-i)})) for i in range(model.nbpml-int(space_order/2),model.nbpml)]
     # Substitute spacing terms to reduce flops
+    print(eqn)
     return Operator(eqn + src_term + rec_term, subs=model.spacing_map,
                     name='Forward', **kwargs)
 
 
 def AdjointOperator(model, source, receiver, space_order=4,
-                    kernel='OT2', **kwargs):
+                    kernel='OT2', save=False, **kwargs):
     """
     Constructor method for the adjoint modelling operator in an acoustic media
 
@@ -102,7 +105,7 @@ def AdjointOperator(model, source, receiver, space_order=4,
     """
     m, damp = model.m, model.damp
 
-    v = TimeFunction(name='v', grid=model.grid, save=None,
+    v = TimeFunction(name='v', grid=model.grid, save=source.nt if save else None,
                      time_order=2, space_order=space_order)
     srca = PointSource(name='srca', grid=model.grid, ntime=source.nt,
                        npoint=source.npoint)

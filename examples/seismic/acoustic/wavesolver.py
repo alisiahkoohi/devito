@@ -49,9 +49,9 @@ class AcousticWaveSolver(object):
                                space_order=self.space_order, **self._kwargs)
 
     @memoized_meth
-    def op_adj(self):
+    def op_adj(self, save=None):
         """Cached operator for adjoint runs"""
-        return AdjointOperator(self.model, save=None, source=self.source,
+        return AdjointOperator(self.model, save=save, source=self.source,
                                receiver=self.receiver, kernel=self.kernel,
                                space_order=self.space_order, **self._kwargs)
 
@@ -106,7 +106,7 @@ class AcousticWaveSolver(object):
                                           dt=kwargs.pop('dt', self.dt), **kwargs)
         return rec, u, summary
 
-    def adjoint(self, rec, srca=None, v=None, m=None, **kwargs):
+    def adjoint(self, rec, srca=None, v=None, m=None, save=None, **kwargs):
         """
         Adjoint modelling function that creates the necessary
         data objects for running an adjoint modelling operator.
@@ -129,6 +129,7 @@ class AcousticWaveSolver(object):
         # Create the adjoint wavefield if not provided
         if v is None:
             v = TimeFunction(name='v', grid=self.model.grid,
+                             save=self.source.nt if save else None,
                              time_order=2, space_order=self.space_order)
 
         # Pick m from model unless explicitly provided
@@ -136,7 +137,7 @@ class AcousticWaveSolver(object):
             m = self.model.m
 
         # Execute operator and return wavefield and receiver data
-        summary = self.op_adj().apply(srca=srca, rec=rec, v=v, m=m,
+        summary = self.op_adj(save).apply(srca=srca, rec=rec, v=v, m=m,
                                       dt=kwargs.pop('dt', self.dt), **kwargs)
         return srca, v, summary
 
