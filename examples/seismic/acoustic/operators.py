@@ -203,5 +203,5 @@ def BornOperator(model, source, receiver, space_order=4,
     receivers = rec.interpolate(expr=U, offset=model.nbpml)
 
     # Substitute spacing terms to reduce flops
-    return Operator(eqn1 + source + eqn2 + receivers, subs=model.spacing_map,
+    return Operator(eqn1 + eqn2 + source + receivers, subs=model.spacing_map,
                     name='Born', **kwargs)
