@@ -1,9 +1,11 @@
 import sympy
+from sympy.core.cache import cacheit
 import numpy as np
 from cached_property import cached_property
 
 from devito.exceptions import InvalidArgument
 from devito.types import AbstractSymbol, Scalar, Symbol
+from devito.logger import debug
 
 __all__ = ['Dimension', 'SpaceDimension', 'TimeDimension', 'DefaultDimension',
            'SteppingDimension', 'SubDimension', 'ConditionalDimension', 'dimensions']
@@ -32,10 +34,16 @@ class Dimension(AbstractSymbol):
     :param spacing: Optional, symbol for the spacing along this dimension.
     """
 
-    def __new__(cls, name, **kwargs):
-        newobj = sympy.Symbol.__new__(cls, name)
-        newobj._spacing = kwargs.get('spacing', Scalar(name='h_%s' % name))
+    def __new__(cls, name, spacing=None):
+        return Dimension.__xnew_cached_(cls, name, spacing)
+
+    def __new_stage2__(cls, name, spacing=None):
+        newobj = sympy.Symbol.__xnew__(cls, name)
+        newobj._spacing = spacing or Scalar(name='h_%s' % name)
         return newobj
+
+    __xnew__ = staticmethod(__new_stage2__)
+    __xnew_cached_ = staticmethod(cacheit(__new_stage2__))
 
     def __str__(self):
         return self.name
@@ -181,9 +189,14 @@ class Dimension(AbstractSymbol):
             raise InvalidArgument("OOB detected due to %s=%d" % (self.max_name,
                                                                  args[self.max_name]))
 
-        if args[self.max_name] < args[self.min_name]:
+        # Allow the specific case of max=min-1, which disables the loop
+        if args[self.max_name] < args[self.min_name]-1:
             raise InvalidArgument("Illegal max=%s < min=%s"
                                   % (args[self.max_name], args[self.min_name]))
+        elif args[self.max_name] == args[self.min_name]-1:
+            debug("%s=%d and %s=%d might cause no iterations along Dimension %s",
+                  self.min_name, args[self.min_name],
+                  self.max_name, args[self.max_name], self.name)
 
 
 class SpaceDimension(Dimension):
@@ -221,12 +234,16 @@ class DefaultDimension(Dimension):
 
     """
     Dimension symbol to represent a dimension that has a statically-known size.
+
+    .. note::
+
+        A DefaultDimension carries a value, so it has a mutable state. Hence, it
+        is not cached.
     """
 
-    def __new__(cls, name, **kwargs):
-        newobj = sympy.Symbol.__new__(cls, name)
-        newobj._spacing = kwargs.get('spacing', Scalar(name='h_%s' % name))
-        newobj._default_value = kwargs.get('default_value', None)
+    def __new__(cls, name, spacing=None, default_value=None):
+        newobj = Dimension.__xnew__(cls, name)
+        newobj._default_value = default_value or 0
         return newobj
 
     def _arg_defaults(self, start=None, size=None, alias=None):
@@ -243,18 +260,23 @@ class DerivedDimension(Dimension):
     Dimension symbol derived from a ``parent`` Dimension.
 
     :param name: Name of the dimension symbol.
-    :param parent: Parent dimension from which the ``DerivedDimension`` is
-                   created.
+    :param parent: The parent Dimension.
     """
 
-    def __new__(cls, name, parent, **kwargs):
-        newobj = sympy.Symbol.__new__(cls, name)
+    def __new__(cls, name, parent):
+        return DerivedDimension.__xnew_cached_(cls, name, parent)
+
+    def __new_stage2__(cls, name, parent):
         assert isinstance(parent, Dimension)
+        newobj = sympy.Symbol.__xnew__(cls, name)
         newobj._parent = parent
         # Inherit time/space identifiers
         newobj.is_Time = parent.is_Time
         newobj.is_Space = parent.is_Space
         return newobj
+
+    __xnew__ = staticmethod(__new_stage2__)
+    __xnew_cached_ = staticmethod(cacheit(__new_stage2__))
 
     @property
     def parent(self):
@@ -296,11 +318,16 @@ class SubDimension(DerivedDimension):
     :param upper: Symbolic expression to provide the upper bound
     """
 
-    def __new__(cls, name, parent, lower, upper, size, **kwargs):
-        newobj = DerivedDimension.__new__(cls, name, parent, **kwargs)
+    def __new__(cls, name, parent, lower, upper, size):
+        return SubDimension.__xnew_cached_(cls, name, parent, lower, upper, size)
+
+    def __new_stage2__(cls, name, parent, lower, upper, size):
+        newobj = DerivedDimension.__xnew__(cls, name, parent)
         newobj._interval = sympy.Interval(lower, upper)
         newobj._size = size
         return newobj
+
+    __xnew_cached_ = staticmethod(cacheit(__new_stage2__))
 
     @classmethod
     def left(cls, name, parent, thickness):
@@ -402,11 +429,16 @@ class ConditionalDimension(DerivedDimension):
 
     """
 
-    def __new__(cls, name, parent, **kwargs):
-        newobj = DerivedDimension.__new__(cls, name, parent, **kwargs)
-        newobj._factor = kwargs.get('factor')
-        newobj._condition = kwargs.get('condition')
+    def __new__(cls, name, parent, factor=None, condition=None):
+        return ConditionalDimension.__xnew_cached_(cls, name, parent, factor, condition)
+
+    def __new_stage2__(cls, name, parent, factor, condition):
+        newobj = DerivedDimension.__xnew__(cls, name, parent)
+        newobj._factor = factor
+        newobj._condition = condition
         return newobj
+
+    __xnew_cached_ = staticmethod(cacheit(__new_stage2__))
 
     @property
     def spacing(self):
