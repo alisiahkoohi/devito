@@ -152,10 +152,10 @@ def GradientOperator(model, source, receiver, space_order=4, save=True,
     if kernel == 'OT2':
         if isic==False:
             gradient_update = Inc(grad, grad - u.dt2 * v)
-            print('Bye')
         else:
+            print('Inverse scattering imaging condition')            
             gradient_update = Inc(grad, grad -(u * v.dt2 * m + u.dx * v.dx + u.dy * v.dy))
-            print('Hello')
+
     elif kernel == 'OT4':
         gradient_update = Inc(grad, grad - (u.dt2 +
                                            s**2 / 12.0 * u.laplace2(m**(-2))) * v)
