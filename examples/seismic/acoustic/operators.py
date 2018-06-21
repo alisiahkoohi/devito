@@ -125,7 +125,7 @@ def AdjointOperator(model, source, receiver, space_order=4,
 
 
 def GradientOperator(model, source, receiver, space_order=4, save=True,
-                     kernel='OT2', **kwargs):
+                     kernel='OT2', isic=False, **kwargs):
     """
     Constructor method for the gradient operator in an acoustic media
 
@@ -150,7 +150,12 @@ def GradientOperator(model, source, receiver, space_order=4, save=True,
     eqn = iso_stencil(v, m, s, damp, kernel, forward=False)
 
     if kernel == 'OT2':
-        gradient_update = Inc(grad, grad - u.dt2 * v)
+        if isic==False:
+            gradient_update = Inc(grad, grad - u.dt2 * v)
+            print('Bye')
+        else:
+            gradient_update = Inc(grad, grad -(u * v.dt2 * m + u.dx * v.dx + u.dy * v.dy))
+            print('Hello')
     elif kernel == 'OT4':
         gradient_update = Inc(grad, grad - (u.dt2 +
                                            s**2 / 12.0 * u.laplace2(m**(-2))) * v)
