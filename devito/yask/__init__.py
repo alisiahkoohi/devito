@@ -4,6 +4,7 @@ JIT-compile, and run kernels.
 """
 
 import os
+import sys
 
 from devito.dle import BasicRewriter, init_dle
 from devito.exceptions import InvalidOperator
@@ -39,10 +40,17 @@ namespace['yask-output-dir'] = make_tempdir('yask')
 # The YASK compiler expects the generated code under:
 # $YASK_OUTPUT_DIR/build/kernel/$stencil.$arch/gen/yask_stencil_code.hpp
 namespace['yask-lib'] = os.path.join(namespace['yask-output-dir'], 'lib')
+namespace['yask-pylib'] = os.path.join(namespace['yask-output-dir'], 'yask')
 namespace['yask-codegen'] = lambda i, j, k: os.path.join(namespace['yask-output-dir'],
                                                          'build', 'kernel',
                                                          '%s.%s.%s' % (i, j, k), 'gen')
 namespace['yask-codegen-file'] = 'yask_stencil_code.hpp'
+
+# All dynamically generated Python modules are stored here
+os.makedirs(namespace['yask-pylib'], exist_ok=True)
+with open(os.path.join(namespace['yask-pylib'], '__init__.py'), 'w') as f:
+    f.write('')
+sys.path.append(os.path.join(namespace['yask-pylib']))
 
 
 # Need a custom compiler to compile YASK kernels
@@ -64,7 +72,6 @@ class YaskCompiler(configuration['compiler'].__class__):
 yask_configuration = Parameters('yask')
 yask_configuration.add('compiler', YaskCompiler())
 callback = lambda i: eval(i) if i else ()
-yask_configuration.add('autotuning', 'runtime', ['off', 'runtime', 'preemptive'])
 yask_configuration.add('folding', (), callback=callback)
 yask_configuration.add('blockshape', (), callback=callback)
 yask_configuration.add('clustering', (), callback=callback)
@@ -72,7 +79,6 @@ yask_configuration.add('options', None)
 yask_configuration.add('dump', None)
 
 env_vars_mapper = {
-    'DEVITO_YASK_AUTOTUNING': 'autotuning',
     'DEVITO_YASK_FOLDING': 'folding',
     'DEVITO_YASK_BLOCKING': 'blockshape',
     'DEVITO_YASK_CLUSTERING': 'clustering',

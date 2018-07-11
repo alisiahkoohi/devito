@@ -14,7 +14,8 @@ from codepy.toolchain import GCCToolchain
 from devito.exceptions import CompilationError
 from devito.logger import log, warning
 from devito.parameters import configuration
-from devito.tools import change_directory, memoized_func, make_tempdir
+from devito.tools import (as_tuple, change_directory, filter_ordered,
+                          memoized_func, make_tempdir)
 
 __all__ = ['jit_compile', 'load', 'make', 'GNUCompiler']
 
@@ -148,6 +149,22 @@ class Compiler(GCCToolchain):
     def __repr__(self):
         return "DevitoJITCompiler[%s]" % self.__class__.__name__
 
+    def __getstate__(self):
+        # The superclass would otherwise only return a subset of attributes
+        return self.__dict__
+
+    def add_include_dirs(self, dirs):
+        self.include_dirs = filter_ordered(self.include_dirs + list(as_tuple(dirs)))
+
+    def add_library_dirs(self, dirs):
+        self.library_dirs = filter_ordered(self.library_dirs + list(as_tuple(dirs)))
+
+    def add_libraries(self, libs):
+        self.libraries = filter_ordered(self.libraries + list(as_tuple(libs)))
+
+    def add_ldflags(self, flags):
+        self.ldflags = filter_ordered(self.ldflags + list(as_tuple(flags)))
+
 
 class GNUCompiler(Compiler):
     """Set of standard compiler flags for the GCC toolchain."""
@@ -267,6 +284,25 @@ def load(soname):
     :return: The loaded shared object.
     """
     return npct.load_library(str(get_jit_dir().joinpath(soname)), '.')
+
+
+def save(soname, binary, compiler):
+    """
+    Store a binary into a file within a temporary directory.
+
+    :param soname: Name of the .so file (w/o the suffix).
+    :param binary: The binary data.
+    :param compiler: The toolchain used for compilation.
+    """
+    sofile = get_jit_dir().joinpath(soname).with_suffix(compiler.so_ext)
+    if sofile.is_file():
+        log("%s: `%s` was not saved in `%s` as it already exists"
+            % (compiler, sofile.name, get_jit_dir()))
+    else:
+        with open(str(path), 'wb') as f:
+            f.write(binary)
+        log("%s: `%s` successfully saved in `%s`"
+            % (compiler, sofile.name, get_jit_dir()))
 
 
 def jit_compile(soname, code, compiler):
