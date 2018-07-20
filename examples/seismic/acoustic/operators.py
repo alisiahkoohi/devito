@@ -194,7 +194,7 @@ def BornOperator(model, source, receiver, space_order=4,
                      time_order=2, space_order=space_order)
     U = TimeFunction(name="U", grid=model.grid, save=None,
                      time_order=2, space_order=space_order)
-    dm = Function(name="dm", grid=model.grid)
+    dm = Function(name="dm", grid=model.grid, space_order=0)
 
     s = model.grid.stepping_dim.spacing
     eqn1 = iso_stencil(u, m, s, damp, kernel)
