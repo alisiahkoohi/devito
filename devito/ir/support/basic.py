@@ -163,7 +163,7 @@ class IndexMode(Tag):
     Tag for access functions.
     """
 
-    _repr = 'IM'
+    pass
 
 
 CONSTANT = IndexMode('constant')
@@ -283,6 +283,11 @@ class IterationInstance(Vector):
     @property
     def is_scalar(self):
         return self.rank == 0
+
+    def affine_if_present(self, findices):
+        """Return False if any of the provided findices appears in self and
+        is not affine, True otherwise."""
+        return (set(findices) & set(self.findices)).issubset(set(self.findices_affine))
 
     def distance(self, other, findex=None, view=None):
         """Compute the distance from ``self`` to ``other``.

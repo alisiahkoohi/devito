@@ -14,7 +14,8 @@ class OperatorCore(OperatorRunnable):
 
     def _specialize_exprs(self, expressions):
         # Align data accesses to the computational domain
-        expressions = [align_accesses(e) for e in expressions]
+        key = lambda i: i.is_TensorFunction
+        expressions = [align_accesses(e, key=key) for e in expressions]
         return super(OperatorCore, self)._specialize_exprs(expressions)
 
     def _autotune(self, args):
@@ -22,8 +23,8 @@ class OperatorCore(OperatorRunnable):
         Use auto-tuning on this Operator to determine empirically the
         best block sizes when loop blocking is in use.
         """
-        if self.dle_flags.get('blocking', False):
-            return autotune(self, args, self.parameters, self.dle_args)
+        if self._dle_flags.get('blocking', False):
+            return autotune(self, args, self.parameters, self._dle_args)
         else:
             return args
 

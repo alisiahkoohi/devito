@@ -2,22 +2,21 @@ import numpy as np
 from argparse import ArgumentParser
 
 from devito.logger import info
-from devito import Constant
+from devito import Constant, Eq, Function, Operator
 from examples.seismic.acoustic import AcousticWaveSolver
 from examples.seismic import demo_model, TimeAxis, RickerSource, Receiver
 
 
-# Velocity models
-def smooth10(vel, shape):
-    if np.isscalar(vel):
-        return .9 * vel * np.ones(shape, dtype=np.float32)
-    out = np.copy(vel)
-    nz = shape[-1]
-
-    for a in range(5, nz-6):
-            out[..., a] = np.sum(vel[..., a - 5:a + 5], axis=len(shape)-1) / 10
-
-    return out
+def smooth(dest, f):
+    """
+    Run an n-point moving average kernel over ``f`` and store the result
+    into ``dest``. The average is computed along the innermost ``f`` dimension.
+    """
+    if f.is_Constant:
+        # Return a scaled version of the input if it's a Constant
+        dest.data[:] = .9 * f.data
+    else:
+        Operator(Eq(dest, f.avg(dims=f.dimensions[-1])), name='smoother').apply()
 
 
 def acoustic_setup(shape=(50, 50, 50), spacing=(15.0, 15.0, 15.0),
@@ -58,8 +57,11 @@ def run(shape=(50, 50, 50), spacing=(20.0, 20.0, 20.0), tn=1000.0,
                             space_order=space_order, kernel=kernel,
                             constant=constant, **kwargs)
 
-    initial_vp = smooth10(solver.model.m.data, solver.model.shape_domain)
-    dm = np.float32(initial_vp**2 - solver.model.m.data)
+    # Smooth velocity
+    initial_vp = Function(name='v0', grid=solver.model.grid, space_order=space_order)
+    smooth(initial_vp, solver.model.m)
+    dm = np.float32(initial_vp.data**2 - solver.model.m.data)
+
     info("Applying Forward")
     # Whether or not we save the whole time history. We only need the full wavefield
     # with 'save=True' if we compute the gradient without checkpointing, if we use
@@ -102,13 +104,13 @@ if __name__ == "__main__":
     parser.add_argument("-k", dest="kernel", default='OT2',
                         choices=['OT2', 'OT4'],
                         help="Choice of finite-difference kernel")
-    parser.add_argument("-dse", "-dse", default="advanced",
+    parser.add_argument("-dse", default="advanced",
                         choices=["noop", "basic", "advanced",
                                  "speculative", "aggressive"],
                         help="Devito symbolic engine (DSE) mode")
     parser.add_argument("-dle", default="advanced",
                         choices=["noop", "advanced", "speculative"],
-                        help="Devito loop engine (DSE) mode")
+                        help="Devito loop engine (DLE) mode")
     parser.add_argument("--constant", default=False, action='store_true',
                         help="Constant velocity model, default is a two layer model")
     parser.add_argument("--checkpointing", default=False, action='store_true',

@@ -1,9 +1,12 @@
 import sympy
+from sympy.core.cache import cacheit
 import numpy as np
 from cached_property import cached_property
 
 from devito.exceptions import InvalidArgument
-from devito.types import AbstractSymbol, Scalar, Symbol
+from devito.types import AbstractSymbol, Scalar
+from devito.logger import debug
+from devito.tools import Pickable
 
 __all__ = ['Dimension', 'SpaceDimension', 'TimeDimension', 'DefaultDimension',
            'SteppingDimension', 'SubDimension', 'ConditionalDimension', 'dimensions']
@@ -22,8 +25,6 @@ class Dimension(AbstractSymbol):
     is_Conditional = False
     is_Stepping = False
 
-    is_Lowered = False
-
     """
     A Dimension is a symbol representing a problem dimension and thus defining a
     potential iteration space.
@@ -32,10 +33,16 @@ class Dimension(AbstractSymbol):
     :param spacing: Optional, symbol for the spacing along this dimension.
     """
 
-    def __new__(cls, name, **kwargs):
-        newobj = sympy.Symbol.__new__(cls, name)
-        newobj._spacing = kwargs.get('spacing', Scalar(name='h_%s' % name))
+    def __new__(cls, name, spacing=None):
+        return Dimension.__xnew_cached_(cls, name, spacing)
+
+    def __new_stage2__(cls, name, spacing=None):
+        newobj = sympy.Symbol.__xnew__(cls, name)
+        newobj._spacing = spacing or Scalar(name='h_%s' % name)
         return newobj
+
+    __xnew__ = staticmethod(__new_stage2__)
+    __xnew_cached_ = staticmethod(cacheit(__new_stage2__))
 
     def __str__(self):
         return self.name
@@ -92,8 +99,16 @@ class Dimension(AbstractSymbol):
     def base(self):
         return self
 
+    @property
+    def root(self):
+        return self
+
+    @property
+    def _properties(self):
+        return (self.spacing,)
+
     def _hashable_content(self):
-        return super(Dimension, self)._hashable_content() + (self.spacing,)
+        return super(Dimension, self)._hashable_content() + self._properties
 
     @property
     def _defines(self):
@@ -181,9 +196,19 @@ class Dimension(AbstractSymbol):
             raise InvalidArgument("OOB detected due to %s=%d" % (self.max_name,
                                                                  args[self.max_name]))
 
-        if args[self.max_name] < args[self.min_name]:
+        # Allow the specific case of max=min-1, which disables the loop
+        if args[self.max_name] < args[self.min_name]-1:
             raise InvalidArgument("Illegal max=%s < min=%s"
                                   % (args[self.max_name], args[self.min_name]))
+        elif args[self.max_name] == args[self.min_name]-1:
+            debug("%s=%d and %s=%d might cause no iterations along Dimension %s",
+                  self.min_name, args[self.min_name],
+                  self.max_name, args[self.max_name], self.name)
+
+    # Pickling support
+    _pickle_args = ['name']
+    _pickle_kwargs = ['spacing']
+    __reduce_ex__ = Pickable.__reduce_ex__
 
 
 class SpaceDimension(Dimension):
@@ -221,12 +246,16 @@ class DefaultDimension(Dimension):
 
     """
     Dimension symbol to represent a dimension that has a statically-known size.
+
+    .. note::
+
+        A DefaultDimension carries a value, so it has a mutable state. Hence, it
+        is not cached.
     """
 
-    def __new__(cls, name, **kwargs):
-        newobj = sympy.Symbol.__new__(cls, name)
-        newobj._spacing = kwargs.get('spacing', Scalar(name='h_%s' % name))
-        newobj._default_value = kwargs.get('default_value', None)
+    def __new__(cls, name, spacing=None, default_value=None):
+        newobj = Dimension.__xnew__(cls, name)
+        newobj._default_value = default_value or 0
         return newobj
 
     def _arg_defaults(self, start=None, size=None, alias=None):
@@ -239,33 +268,58 @@ class DerivedDimension(Dimension):
 
     is_Derived = True
 
+    _keymap = {}
+    """Map all seen instance `_properties` to a unique number. This is used
+    to create unique Dimension names."""
+
     """
     Dimension symbol derived from a ``parent`` Dimension.
 
     :param name: Name of the dimension symbol.
-    :param parent: Parent dimension from which the ``DerivedDimension`` is
-                   created.
+    :param parent: The parent Dimension.
     """
 
-    def __new__(cls, name, parent, **kwargs):
-        newobj = sympy.Symbol.__new__(cls, name)
+    def __new__(cls, name, parent):
+        return DerivedDimension.__xnew_cached_(cls, name, parent)
+
+    def __new_stage2__(cls, name, parent):
         assert isinstance(parent, Dimension)
+        newobj = sympy.Symbol.__xnew__(cls, name)
         newobj._parent = parent
         # Inherit time/space identifiers
         newobj.is_Time = parent.is_Time
         newobj.is_Space = parent.is_Space
         return newobj
 
+    __xnew__ = staticmethod(__new_stage2__)
+    __xnew_cached_ = staticmethod(cacheit(__new_stage2__))
+
+    @classmethod
+    def _gensuffix(cls, key):
+        return cls._keymap.setdefault(key, len(cls._keymap))
+
+    @classmethod
+    def _genname(cls, prefix, key):
+        return "%s%d" % (prefix, cls._gensuffix(key))
+
     @property
     def parent(self):
         return self._parent
 
     @property
+    def root(self):
+        return self._parent.root
+
+    @property
     def spacing(self):
         return self.parent.spacing
 
+    @property
+    def _properties(self):
+        return ()
+
     def _hashable_content(self):
-        return (self.name, self.parent._hashable_content())
+        return (self.name, self.parent._hashable_content()) + self._properties
 
     @property
     def _defines(self):
@@ -280,6 +334,10 @@ class DerivedDimension(Dimension):
         A :class:`DerivedDimension` performs no runtime checks.
         """
         return
+
+    # Pickling support
+    _pickle_args = Dimension._pickle_args + ['parent']
+    _pickle_kwargs = []
 
 
 class SubDimension(DerivedDimension):
@@ -296,11 +354,16 @@ class SubDimension(DerivedDimension):
     :param upper: Symbolic expression to provide the upper bound
     """
 
-    def __new__(cls, name, parent, lower, upper, size, **kwargs):
-        newobj = DerivedDimension.__new__(cls, name, parent, **kwargs)
+    def __new__(cls, name, parent, lower, upper, size):
+        return SubDimension.__xnew_cached_(cls, name, parent, lower, upper, size)
+
+    def __new_stage2__(cls, name, parent, lower, upper, size):
+        newobj = DerivedDimension.__xnew__(cls, name, parent)
         newobj._interval = sympy.Interval(lower, upper)
         newobj._size = size
         return newobj
+
+    __xnew_cached_ = staticmethod(cacheit(__new_stage2__))
 
     @classmethod
     def left(cls, name, parent, thickness):
@@ -355,9 +418,9 @@ class SubDimension(DerivedDimension):
             val = self.symbolic_end - self.parent.symbolic_end
             return int(val), self.parent.symbolic_end
 
-    def _hashable_content(self):
-        return super(SubDimension, self)._hashable_content() + (self._interval,
-                                                                self._size)
+    @property
+    def _properties(self):
+        return (self._interval, self._size)
 
     def _arg_defaults(self, **kwargs):
         """
@@ -372,6 +435,11 @@ class SubDimension(DerivedDimension):
         no argument values to be derived.
         """
         return {}
+
+    # Pickling support
+    _pickle_args = DerivedDimension._pickle_args +\
+        ['symbolic_start', 'symbolic_end', 'symbolic_size']
+    _pickle_kwargs = []
 
 
 class ConditionalDimension(DerivedDimension):
@@ -402,11 +470,16 @@ class ConditionalDimension(DerivedDimension):
 
     """
 
-    def __new__(cls, name, parent, **kwargs):
-        newobj = DerivedDimension.__new__(cls, name, parent, **kwargs)
-        newobj._factor = kwargs.get('factor')
-        newobj._condition = kwargs.get('condition')
+    def __new__(cls, name, parent, factor=None, condition=None):
+        return ConditionalDimension.__xnew_cached_(cls, name, parent, factor, condition)
+
+    def __new_stage2__(cls, name, parent, factor, condition):
+        newobj = DerivedDimension.__xnew__(cls, name, parent)
+        newobj._factor = factor
+        newobj._condition = condition
         return newobj
+
+    __xnew_cached_ = staticmethod(cacheit(__new_stage2__))
 
     @property
     def spacing(self):
@@ -420,9 +493,12 @@ class ConditionalDimension(DerivedDimension):
     def condition(self):
         return self._condition
 
-    def _hashable_content(self):
-        return super(ConditionalDimension, self)._hashable_content() + (self.factor,
-                                                                        self.condition)
+    @property
+    def _properties(self):
+        return (self._factor, self._condition)
+
+    # Pickling support
+    _pickle_kwargs = DerivedDimension._pickle_kwargs + ['factor', 'condition']
 
 
 class SteppingDimension(DerivedDimension):
@@ -501,28 +577,133 @@ class SteppingDimension(DerivedDimension):
         return values
 
 
-class LoweredDimension(Dimension):
-
-    is_Lowered = True
+class ModuloDimension(DerivedDimension):
 
     """
-    Dimension symbol representing a modulo iteration created when
-    resolving a :class:`SteppingDimension`.
+    Dimension symbol representing a non-contiguous sub-region of a given
+    ``parent`` Dimension, which cyclically produces a finite range of values,
+    such as ``0, 1, 2, 0, 1, 2, 0, ...``.
 
-    :param origin: The expression mapped to this dimension.
+    :param parent: Parent dimension from which the ModuloDimension is created.
+    :param offset: An integer representing an offset from the parent dimension.
+    :param modulo: The extent of the range.
+    :param name: (Optional) force a name for this Dimension.
     """
 
-    def __new__(cls, name, origin, **kwargs):
-        newobj = sympy.Symbol.__new__(cls, name)
-        newobj._origin = origin
+    def __new__(cls, parent, offset, modulo, name=None):
+        return ModuloDimension.__xnew_cached_(cls, parent, offset, modulo, name)
+
+    def __new_stage2__(cls, parent, offset, modulo, name):
+        if name is None:
+            name = cls._genname(parent.name, (offset, modulo))
+        newobj = DerivedDimension.__xnew__(cls, name, parent)
+        newobj._offset = offset
+        newobj._modulo = modulo
         return newobj
+
+    __xnew_cached_ = staticmethod(cacheit(__new_stage2__))
+
+    @property
+    def offset(self):
+        return self._offset
+
+    @property
+    def modulo(self):
+        return self._modulo
 
     @property
     def origin(self):
-        return self._origin
+        return self.parent + self.offset
 
-    def _hashable_content(self):
-        return Symbol._hashable_content(self) + (self.origin,)
+    @cached_property
+    def symbolic_start(self):
+        return (self.root + self.offset) % self.modulo
+
+    symbolic_incr = symbolic_start
+
+    @property
+    def _properties(self):
+        return (self._offset, self._modulo)
+
+    def _arg_defaults(self, **kwargs):
+        """
+        A :class:`ModuloDimension` provides no arguments, so this method
+        returns an empty dict.
+        """
+        return {}
+
+    def _arg_values(self, *args, **kwargs):
+        """
+        A :class:`ModuloDimension` provides no arguments, so there are
+        no argument values to be derived.
+        """
+        return {}
+
+    # Pickling support
+    _pickle_args = ['parent', 'offset', 'modulo']
+    _pickle_kwargs = ['name']
+
+
+class IncrDimension(DerivedDimension):
+
+    """
+    Dimension symbol representing a non-contiguous sub-region of a given
+    ``parent`` Dimension, with one point every ``step`` points. Thus, if
+    ``step == k``, the dimension represents the sequence ``start, start + k,
+    start + 2*k, ...``.
+
+    :param parent: Parent dimension from which the IncrDimension is created.
+    :param start: An integer representing the starting point of the sequence.
+    :param step: The distance between two consecutive points.
+    :param name: (Optional) force a name for this Dimension.
+    """
+
+    def __new__(cls, parent, start, step, name=None):
+        return IncrDimension.__xnew_cached_(cls, parent, start, step, name)
+
+    def __new_stage2__(cls, parent, start, step, name):
+        if name is None:
+            name = cls._genname(parent.name, (start, step))
+        newobj = DerivedDimension.__xnew__(cls, name, parent)
+        newobj._start = start
+        newobj._step = step
+        return newobj
+
+    __xnew_cached_ = staticmethod(cacheit(__new_stage2__))
+
+    @property
+    def step(self):
+        return self._step
+
+    @cached_property
+    def symbolic_start(self):
+        return self._start
+
+    @property
+    def symbolic_incr(self):
+        return self + self.step
+
+    @property
+    def _properties(self):
+        return (self._start, self._step)
+
+    def _arg_defaults(self, **kwargs):
+        """
+        A :class:`IncrDimension` provides no arguments, so this method
+        returns an empty dict.
+        """
+        return {}
+
+    def _arg_values(self, *args, **kwargs):
+        """
+        A :class:`IncrDimension` provides no arguments, so there are
+        no argument values to be derived.
+        """
+        return {}
+
+    # Pickling support
+    _pickle_args = ['parent', 'symbolic_start', 'step']
+    _pickle_kwargs = ['name']
 
 
 def dimensions(names):

@@ -166,7 +166,7 @@ def test_scheduling_after_rewrite():
 
     op = Operator([eqn1] + eqn2 + [eqn3])
     trees = retrieve_iteration_tree(op)
-
+    from IPython import embed; embed()
     # Check loop nest structure
     assert len(trees) == 4
     assert all(i.dim == j for i, j in zip(trees[0], grid.dimensions))  # time invariant
@@ -355,3 +355,7 @@ def test_collect_aliases(fa, fb, fc, fd, t0, t1, t2, t3, exprs, expected):
 def test_estimate_cost(fa, fb, fc, t0, t1, t2, expr, expected):
     # Note: integer arithmetic isn't counted
     assert estimate_cost(EVAL(expr, fa, fb, fc, t0, t1, t2)) == expected
+
+
+if __name__ =="__main__":
+	test_scheduling_after_rewrite()

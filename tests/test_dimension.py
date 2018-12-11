@@ -369,7 +369,7 @@ class TestSubDimension(object):
         assert all(i.is_Affine and i.is_Sequential for i in iterations if i.dim == xl)
         assert all(i.is_Affine and i.is_Parallel for i in iterations if i.dim == yi)
 
-        op.apply(time_m=0, time_M=0)
+        op.apply(time_m=1, time_M=1)
 
         assert all(np.all(u.data[0, :thickness, thickness+i] == [1, 2, 3, 4])
                    for i in range(12))
@@ -424,7 +424,7 @@ class TestConditionalDimension(object):
         # Creates subsampled spatial dimensions and accordine grid
         dims = tuple([ConditionalDimension(d.name+'sub', parent=d, factor=2)
                       for d in u.grid.dimensions])
-        grid2 = Grid((6, 6), dimensions=dims)
+        grid2 = Grid((6, 6), dimensions=dims, time_dimension=time)
         u2 = TimeFunction(name='u2', grid=grid2, save=nt)
         assert(time in u2.indices)
 
