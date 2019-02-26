@@ -345,7 +345,8 @@ class Model(object):
     """
 
     def __init__(self, origin, spacing, shape, space_order, vp, nbpml=20,
-                 dtype=np.float32, epsilon=None, delta=None, theta=None, phi=None):
+                 dtype=np.float32, epsilon=None, delta=None, theta=None, phi=None, Mydt=0.):
+        self.Mydt = Mydt
         self.shape = shape
         self.nbpml = int(nbpml)
         self.origin = tuple([dtype(o) for o in origin])
@@ -476,7 +477,12 @@ class Model(object):
         # dt <= coeff * h / (max(velocity))
         coeff = 0.38 if len(self.shape) == 3 else 0.42
         dt = self.dtype(coeff * np.min(self.spacing) / (self.scale*np.max(self.vp)))
-        return .001 * int(1000 * dt)
+
+        if self.Mydt == 0.:
+            rtn = .001 * int(1000 * dt)
+        else:
+            rtn = self.Mydt
+        return rtn
 
     @property
     def vp(self):
