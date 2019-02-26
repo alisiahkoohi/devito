@@ -1,7 +1,7 @@
 from devito import Function, TimeFunction, memoized_meth
 from examples.seismic import PointSource, Receiver
 from examples.seismic.acoustic.operators import (
-    ForwardOperator, AdjointOperator, GradientOperator, BornOperator
+    ForwardOperator, AdjointOperator, GradientOperator, BornOperator, A
 )
 from examples.checkpointing.checkpoint import DevitoCheckpoint, CheckpointOperator
 from pyrevolve import Revolver
@@ -70,6 +70,12 @@ class AcousticWaveSolver(object):
         return BornOperator(self.model, save=save, source=self.source,
                             receiver=self.receiver, kernel=self.kernel,
                             space_order=self.space_order, **self._kwargs)
+
+    @memoized_meth
+    def op_A(self):
+        """Cached operator for applying the wave equation to a wavefield"""
+        return A(self.model, source=self.source, kernel=self.kernel,
+                 space_order=self.space_order, **self._kwargs)
 
     def forward(self, src=None, rec=None, u=None, m=None, save=None, **kwargs):
         """
@@ -226,3 +232,33 @@ class AcousticWaveSolver(object):
         summary = self.op_born(save).apply(dm=dmin, u=u, U=U, src=src, rec=rec,
                                            m=m, dt=kwargs.pop('dt', self.dt), **kwargs)
         return rec, u, U, summary
+
+
+    def A(self, u, q=None, srci=None, m=None, **kwargs):
+        """
+        Wave equation application function that creates the necessary
+        data objects for running a forward modelling operator.
+         :param src: Symbol with time series data for the injected source term
+        :param u: Symbol to store the computed wavefield
+        :param q: (Optional) Symbol to store the Au object
+        :param m: (Optional) Symbol for the time-constant square slowness
+         :returns: Source (Au) as a wavefield, src at the source position
+        and performance summary
+        """
+        # Source term is read-only, so re-use the default
+        srci = srci or PointSource(name='srci', grid=self.model.grid,
+                                   time_range=self.source.time_range,
+                                   coordinates=self.source.coordinates.data)
+
+
+         # Create the forward wavefield if not provided
+        q = q or TimeFunction(name='q', grid=self.model.grid,
+                              save=self.source.nt,
+                              time_order=2, space_order=0)
+        # Pick m from model unless explicitly provided
+        m = m or self.model.m
+
+         # Execute operator and return wavefield and receiver data
+        summary = self.op_A().apply(srci=srci, u=u, q=q, m=m,
+                                    dt=kwargs.pop('dt', self.dt), **kwargs)
+        return q, srci, summary
