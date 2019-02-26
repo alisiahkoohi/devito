@@ -135,6 +135,7 @@ class AcousticWaveSolver(object):
         # Create the adjoint wavefield if not provided
 
         v = v or TimeFunction(name='v', grid=self.model.grid,
+                              save=self.source.nt if save else None,          
                               time_order=2, space_order=self.space_order)
         # Pick m from model unless explicitly provided
         m = m or self.model.m

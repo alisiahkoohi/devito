@@ -124,7 +124,7 @@ def ForwardOperator(model, geometry, space_order=4,
                     name='Forward', **kwargs)
 
 def AdjointOperator(model, geometry, space_order=4,
-                    kernel='OT2', **kwargs):
+                    kernel='OT2', save=False, **kwargs):
     """
     Constructor method for the adjoint modelling operator in an acoustic media
 
