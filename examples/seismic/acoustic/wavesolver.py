@@ -1,7 +1,7 @@
 from devito import Function, TimeFunction, memoized_meth
 from examples.seismic import PointSource, Receiver
 from examples.seismic.acoustic.operators import (
-    ForwardOperator, AdjointOperator, GradientOperator, BornOperator
+    ForwardOperator, AdjointOperator, GradientOperator, BornOperator, A
 )
 from examples.checkpointing.checkpoint import DevitoCheckpoint, CheckpointOperator
 from pyrevolve import Revolver
@@ -52,8 +52,9 @@ class AcousticWaveSolver(object):
                                **self._kwargs)
 
     @memoized_meth
-    def op_adj(self):
+    def op_adj(self, save=None):
         """Cached operator for adjoint runs"""
+
         return AdjointOperator(self.model, save=None, geometry=self.geometry,
                                kernel=self.kernel, space_order=self.space_order,
                                **self._kwargs)
@@ -66,11 +67,18 @@ class AcousticWaveSolver(object):
                                 **self._kwargs)
 
     @memoized_meth
-    def op_born(self):
+    def op_born(self, save=False):
         """Cached operator for born runs"""
+
         return BornOperator(self.model, save=None, geometry=self.geometry,
                             kernel=self.kernel, space_order=self.space_order,
                             **self._kwargs)
+
+    @memoized_meth
+    def op_A(self):
+        """Cached operator for applying the wave equation to a wavefield"""
+        return A(self.model, source=self.source, kernel=self.kernel,
+                 space_order=self.space_order, **self._kwargs)
 
     def forward(self, src=None, rec=None, u=None, m=None, save=None, **kwargs):
         """
@@ -105,7 +113,7 @@ class AcousticWaveSolver(object):
                                           dt=kwargs.pop('dt', self.dt), **kwargs)
         return rec, u, summary
 
-    def adjoint(self, rec, srca=None, v=None, m=None, **kwargs):
+    def adjoint(self, rec, srca=None, v=None, m=None, save=None, **kwargs):
         """
         Adjoint modelling function that creates the necessary
         data objects for running an adjoint modelling operator.
@@ -125,18 +133,19 @@ class AcousticWaveSolver(object):
                                    coordinates=self.geometry.src_positions)
 
         # Create the adjoint wavefield if not provided
-        v = v or TimeFunction(name='v', grid=self.model.grid,
-                              time_order=2, space_order=self.space_order)
 
+        v = v or TimeFunction(name='v', grid=self.model.grid,
+                              save=self.source.nt if save else None,          
+                              time_order=2, space_order=self.space_order)
         # Pick m from model unless explicitly provided
         m = m or self.model.m
 
         # Execute operator and return wavefield and receiver data
-        summary = self.op_adj().apply(srca=srca, rec=rec, v=v, m=m,
+        summary = self.op_adj(save).apply(srca=srca, rec=rec, v=v, m=m,
                                       dt=kwargs.pop('dt', self.dt), **kwargs)
         return srca, v, summary
 
-    def gradient(self, rec, u, v=None, grad=None, m=None, checkpointing=False, **kwargs):
+    def gradient(self, rec, u, v=None, grad=None, m=None, isic=False, checkpointing=False, **kwargs):
         """
         Gradient modelling function for computing the adjoint of the
         Linearized Born modelling function, ie. the action of the
@@ -179,7 +188,7 @@ class AcousticWaveSolver(object):
                                            dt=dt, **kwargs)
         return grad, summary
 
-    def born(self, dmin, src=None, rec=None, u=None, U=None, m=None, **kwargs):
+    def born(self, dmin, src=None, rec=None, u=None, U=None, m=None, save=False, **kwargs):
         """
         Linearized Born modelling function that creates the necessary
         data objects for running an adjoint modelling operator.
@@ -202,11 +211,40 @@ class AcousticWaveSolver(object):
                               time_order=2, space_order=self.space_order)
         U = U or TimeFunction(name='U', grid=self.model.grid,
                               time_order=2, space_order=self.space_order)
-
         # Pick m from model unless explicitly provided
         m = m or self.model.m
 
         # Execute operator and return wavefield and receiver data
-        summary = self.op_born().apply(dm=dmin, u=u, U=U, src=src, rec=rec,
-                                       m=m, dt=kwargs.pop('dt', self.dt), **kwargs)
+        summary = self.op_born(save).apply(dm=dmin, u=u, U=U, src=src, rec=rec,
+                                           m=m, dt=kwargs.pop('dt', self.dt), **kwargs)
         return rec, u, U, summary
+
+
+    def A(self, u, q=None, srci=None, m=None, **kwargs):
+        """
+        Wave equation application function that creates the necessary
+        data objects for running a forward modelling operator.
+         :param src: Symbol with time series data for the injected source term
+        :param u: Symbol to store the computed wavefield
+        :param q: (Optional) Symbol to store the Au object
+        :param m: (Optional) Symbol for the time-constant square slowness
+         :returns: Source (Au) as a wavefield, src at the source position
+        and performance summary
+        """
+        # Source term is read-only, so re-use the default
+        srci = srci or PointSource(name='srci', grid=self.model.grid,
+                                   time_range=self.source.time_range,
+                                   coordinates=self.source.coordinates.data)
+
+
+         # Create the forward wavefield if not provided
+        q = q or TimeFunction(name='q', grid=self.model.grid,
+                              save=self.source.nt,
+                              time_order=2, space_order=0)
+        # Pick m from model unless explicitly provided
+        m = m or self.model.m
+
+         # Execute operator and return wavefield and receiver data
+        summary = self.op_A().apply(srci=srci, u=u, q=q, m=m,
+                                    dt=kwargs.pop('dt', self.dt), **kwargs)
+        return q, srci, summary
