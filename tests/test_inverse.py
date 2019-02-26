@@ -1,18 +1,19 @@
 import numpy as np
 import pytest
-from conftest import skipif_yask
+from conftest import skipif
 
 from devito import clear_cache, Operator
 from examples.seismic import demo_model, TimeAxis, RickerSource, Receiver
 from examples.seismic.acoustic import AcousticWaveSolver
 
+pytestmark = skipif(['yask', 'ops'])
 
 presets = {
     'constant': {'preset': 'constant-isotropic'},
     'layers': {'preset': 'layers-isotropic', 'ratio': 3},
 }
 
-@skipif_yask
+
 @pytest.mark.parametrize('mkey, shape, kernel, space_order, nbpml', [
     # 1 tests with varying time and space orders
     ('layers', (61, ), 'OT2', 4, 10), ('layers', (61, ), 'OT2', 8, 10),

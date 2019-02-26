@@ -157,7 +157,7 @@ def AdjointOperator(model, geometry, space_order=4,
                     name='Adjoint', **kwargs)
 
 def GradientOperator(model, geometry, space_order=4, save=True,
-                     kernel='OT2', **kwargs):
+                     kernel='OT2', isic=False, **kwargs):
     """
     Constructor method for the gradient operator in an acoustic media
 

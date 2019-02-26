@@ -508,7 +508,7 @@ class Model(GenericModel):
     :param damp: The damping field for absorbing boundarycondition
     """
     def __init__(self, origin, spacing, shape, space_order, vp, nbpml=20,
-                 dtype=np.float32, epsilon=None, delta=None, theta=None, phi=None, Mydt=0.
+                 dtype=np.float32, epsilon=None, delta=None, theta=None, phi=None, Mydt=0.,
                  subdomains=(), **kwargs):
         super(Model, self).__init__(origin, spacing, shape, space_order, nbpml, dtype,
                                     subdomains)
