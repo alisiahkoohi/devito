@@ -2,7 +2,7 @@ import numpy as np
 from argparse import ArgumentParser
 
 from devito.logger import warning
-from examples.seismic import demo_model, TimeAxis, Receiver, RickerSource
+from examples.seismic import demo_model, AcquisitionGeometry
 from examples.seismic.tti import AnisotropicWaveSolver
 
 
@@ -12,22 +12,21 @@ def tti_setup(shape=(50, 50, 50), spacing=(20.0, 20.0, 20.0), tn=250.0,
     nrec = 101
     # Two layer model for true velocity
     model = demo_model(preset, shape=shape, spacing=spacing, nbpml=nbpml)
-    # Derive timestepping from model spacing
-    dt = model.critical_dt
-    t0 = 0.0
-    time_range = TimeAxis(start=t0, stop=tn, step=dt)
+    # Source and receiver geometries
+    src_coordinates = np.empty((1, len(spacing)))
+    src_coordinates[0, :] = np.array(model.domain_size) * .5
+    if len(shape) > 1:
+        src_coordinates[0, -1] = model.origin[-1] + 2 * spacing[-1]
 
-    # Define source geometry (center of domain, just below surface)
-    src = RickerSource(name='src', grid=model.grid, f0=0.015, time_range=time_range)
-    src.coordinates.data[0, :] = np.array(model.domain_size) * .5
-    src.coordinates.data[0, -1] = model.origin[-1] + 2 * spacing[-1]
+    rec_coordinates = np.empty((nrec, len(spacing)))
+    rec_coordinates[:, 0] = np.linspace(0., model.domain_size[0], num=nrec)
+    if len(shape) > 1:
+        rec_coordinates[:, 1] = np.array(model.domain_size)[1] * .5
+        rec_coordinates[:, -1] = model.origin[-1] + 2 * spacing[-1]
+    geometry = AcquisitionGeometry(model, rec_coordinates, src_coordinates,
+                                   t0=0.0, tn=tn, src_type='Ricker', f0=0.010)
 
-    # Define receiver geometry (spread across x, lust below surface)
-    rec = Receiver(name='nrec', grid=model.grid, time_range=time_range, npoint=nrec)
-    rec.coordinates.data[:, 0] = np.linspace(0., model.domain_size[0], num=nrec)
-    rec.coordinates.data[:, 1:] = src.coordinates.data[0, 1:]
-
-    return AnisotropicWaveSolver(model, source=src, receiver=rec,
+    return AnisotropicWaveSolver(model, geometry,
                                  space_order=space_order, **kwargs)
 
 
@@ -41,7 +40,6 @@ def run(shape=(50, 50, 50), spacing=(20.0, 20.0, 20.0), tn=250.0,
         warning('WARNING: TTI requires a space_order that is a multiple of 4!')
 
     rec, u, v, summary = solver.forward(autotune=autotune, kernel=kernel)
-
     return summary.gflopss, summary.oi, summary.timings, [rec, u, v]
 
 
@@ -59,15 +57,15 @@ if __name__ == "__main__":
     parser.add_argument("--nbpml", default=40,
                         type=int, help="Number of PML layers around the domain")
     parser.add_argument("-k", dest="kernel", default='centered',
-                        choices=['centered', 'shifted'],
+                        choices=['centered', 'shifted', 'staggered'],
                         help="Choice of finite-difference kernel")
-    parser.add_argument("-dse", "-dse", default="advanced",
+    parser.add_argument("-dse", default="advanced",
                         choices=["noop", "basic", "advanced",
                                  "speculative", "aggressive"],
                         help="Devito symbolic engine (DSE) mode")
     parser.add_argument("-dle", default="advanced",
                         choices=["noop", "advanced", "speculative"],
-                        help="Devito loop engine (DSE) mode")
+                        help="Devito loop engine (DLE) mode")
     args = parser.parse_args()
 
     preset = 'layers-tti-noazimuth' if args.azi else 'layers-tti'

@@ -1,14 +1,15 @@
 import numpy as np
 import pytest
 from numpy import linalg
-from conftest import skipif_yask
 
+from conftest import skipif
 from devito import Function, info, clear_cache
-from examples.seismic.acoustic.acoustic_example import smooth10, acoustic_setup as setup
+from examples.seismic.acoustic.acoustic_example import smooth, acoustic_setup as setup
 from examples.seismic import Receiver
 
+pytestmark = skipif(['yask', 'ops'])
 
-@skipif_yask
+
 class TestGradient(object):
 
     def setup_method(self, method):
@@ -47,8 +48,8 @@ class TestGradient(object):
                      kernel=kernel, space_order=space_order,
                      nbpml=40)
 
-        m0 = Function(name='m0', grid=wave.model.m.grid, space_order=space_order)
-        m0.data[:] = smooth10(wave.model.m.data, wave.model.m.shape_domain)
+        m0 = Function(name='m0', grid=wave.model.grid, space_order=space_order)
+        smooth(m0, wave.model.m)
 
         # Compute receiver data for the true velocity
         rec, u, _ = wave.forward()
@@ -58,13 +59,13 @@ class TestGradient(object):
 
         # Gradient: <J^T \delta d, dm>
         residual = Receiver(name='rec', grid=wave.model.grid, data=rec0.data - rec.data,
-                            time_range=rec.time_range, coordinates=rec0.coordinates.data)
+                            time_range=wave.geometry.time_axis,
+                            coordinates=wave.geometry.rec_positions)
 
         gradient, _ = wave.gradient(residual, u0, m=m0, checkpointing=True)
         gradient2, _ = wave.gradient(residual, u0, m=m0, checkpointing=False)
         assert np.allclose(gradient.data, gradient2.data)
 
-    @skipif_yask
     @pytest.mark.parametrize('space_order', [4])
     @pytest.mark.parametrize('kernel', ['OT2'])
     @pytest.mark.parametrize('shape', [(70, 80)])
@@ -95,9 +96,9 @@ class TestGradient(object):
                      kernel=kernel, space_order=space_order,
                      nbpml=40)
 
-        m0 = Function(name='m0', grid=wave.model.m.grid, space_order=space_order)
-        m0.data[:] = smooth10(wave.model.m.data, wave.model.m.shape_domain)
-        dm = np.float32(wave.model.m.data - m0.data)
+        m0 = Function(name='m0', grid=wave.model.grid, space_order=space_order)
+        smooth(m0, wave.model.m)
+        dm = np.float32(wave.model.m.data[:] - m0.data[:])
 
         # Compute receiver data for the true velocity
         rec, u, _ = wave.forward()
@@ -110,7 +111,8 @@ class TestGradient(object):
 
         # Gradient: <J^T \delta d, dm>
         residual = Receiver(name='rec', grid=wave.model.grid, data=rec0.data - rec.data,
-                            time_range=rec.time_range, coordinates=rec0.coordinates.data)
+                            time_range=wave.geometry.time_axis,
+                            coordinates=wave.geometry.rec_positions)
 
         gradient, _ = wave.gradient(residual, u0, m=m0, checkpointing=checkpointing)
         G = np.dot(gradient.data.reshape(-1), dm.reshape(-1))
@@ -128,9 +130,10 @@ class TestGradient(object):
             # Data for the new model
             d = wave.forward(m=mloc)[0]
             # First order error Phi(m0+dm) - Phi(m0)
-            error1[i] = np.absolute(.5*linalg.norm(d.data - rec.data)**2 - F0)
+            F_i = .5*linalg.norm((d.data - rec.data).reshape(-1))**2
+            error1[i] = np.absolute(F_i - F0)
             # Second order term r Phi(m0+dm) - Phi(m0) - <J(m0)^T \delta d, dm>
-            error2[i] = np.absolute(.5*linalg.norm(d.data - rec.data)**2 - F0 - H[i] * G)
+            error2[i] = np.absolute(F_i - F0 - H[i] * G)
 
         # Test slope of the  tests
         p1 = np.polyfit(np.log10(H), np.log10(error1), 1)
@@ -163,12 +166,12 @@ class TestGradient(object):
                      kernel=kernel, space_order=space_order,
                      tn=1000., nbpml=10+space_order/2)
 
-        m0 = Function(name='m0', grid=wave.model.m.grid, space_order=space_order)
-        m0.data[:] = smooth10(wave.model.m.data, wave.model.shape_domain)
+        m0 = Function(name='m0', grid=wave.model.grid, space_order=space_order)
+        smooth(m0, wave.model.m)
         dm = np.float64(wave.model.m.data - m0.data)
         linrec = Receiver(name='rec', grid=wave.model.grid,
-                          time_range=wave.receiver.time_range,
-                          coordinates=wave.receiver.coordinates.data)
+                          time_range=wave.geometry.time_axis,
+                          coordinates=wave.geometry.rec_positions)
 
         # Compute receiver data and full wavefield for the smooth velocity
         rec, u0, _ = wave.forward(m=m0, save=False)
@@ -187,10 +190,12 @@ class TestGradient(object):
                             initializer=initializer)
             # Data for the new model
             d = wave.forward(m=mloc)[0]
+            delta_d = (d.data - rec.data).reshape(-1)
             # First order error F(m0 + hdm) - F(m0)
-            error1[i] = np.linalg.norm(d.data - rec.data, 1)
+
+            error1[i] = np.linalg.norm(delta_d, 1)
             # Second order term F(m0 + hdm) - F(m0) - J dm
-            error2[i] = np.linalg.norm(d.data - rec.data - H[i] * Jdm.data, 1)
+            error2[i] = np.linalg.norm(delta_d - H[i] * Jdm.data.reshape(-1), 1)
 
         # Test slope of the  tests
         p1 = np.polyfit(np.log10(H), np.log10(error1), 1)
@@ -203,4 +208,5 @@ class TestGradient(object):
 
 
 if __name__ == "__main__":
-    TestGradient().test_gradientFWI(shape=(70, 80), kernel='OT2', space_order=4)
+    TestGradient().test_gradientFWI(shape=(70, 80), kernel='OT2', space_order=4,
+                                    checkpointing=False)

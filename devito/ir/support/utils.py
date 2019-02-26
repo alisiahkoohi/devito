@@ -1,22 +1,20 @@
 from collections import OrderedDict, defaultdict
-from itertools import groupby
 
-from devito.dimension import Dimension, ModuloDimension
-from devito.ir.support.basic import Access, Scope
+from devito.ir.support.basic import Access
 from devito.ir.support.space import Interval, Backward, Forward, Any
 from devito.ir.support.stencil import Stencil
 from devito.symbolics import retrieve_indexed, retrieve_terminals
 from devito.tools import as_tuple, flatten, filter_sorted
+from devito.types import Dimension, ModuloDimension
 
 __all__ = ['detect_accesses', 'detect_oobs', 'build_iterators', 'build_intervals',
-           'detect_flow_directions', 'force_directions', 'group_expressions',
-           'align_accesses', 'detect_io']
+           'detect_flow_directions', 'force_directions', 'align_accesses', 'detect_io']
 
 
 def detect_accesses(expr):
     """
-    Return a mapper ``M : F -> S``, where F are :class:`Function`s appearing
-    in ``expr`` and S are :class:`Stencil`s. ``M[f]`` represents all data accesses
+    Return a mapper ``M : F -> S``, where F are Functions appearing
+    in ``expr`` and S are Stencils. ``M[f]`` represents all data accesses
     to ``f`` within ``expr``. Also map ``M[None]`` to all Dimensions used in
     ``expr`` as plain symbols, rather than as array indices.
     """
@@ -47,21 +45,21 @@ def detect_accesses(expr):
 def detect_oobs(mapper):
     """
     Given M as produced by :func:`detect_accesses`, return the set of
-    :class:`Dimension`s that cannot be iterated over for the entire
-    computational domain, to avoid out-of-bounds (OOB) accesses.
+    Dimensions that *cannot* be iterated over the entire computational
+    domain, to avoid out-of-bounds (OOB) accesses.
     """
     found = set()
     for f, stencil in mapper.items():
-        if f is None or not f.is_TensorFunction:
+        if f is None or not f.is_DiscreteFunction:
             continue
         for d, v in stencil.items():
             p = d.parent if d.is_Sub else d
             try:
-                if min(v) < 0 or max(v) > sum(f._offset_domain[p]):
+                if min(v) < 0 or max(v) > sum(f._size_halo[p]):
                     found.add(p)
             except KeyError:
                 # Unable to detect presence of OOB accesses
-                # (/p/ not in /f._offset_domain/, typical of indirect
+                # (/p/ not in /f._size_halo/, typical of indirect
                 # accesses such as A[B[i]])
                 pass
     return found | {i.parent for i in found if i.is_Derived}
@@ -70,8 +68,8 @@ def detect_oobs(mapper):
 def build_iterators(mapper):
     """
     Given M as produced by :func:`detect_accesses`, return a mapper ``M' : D -> V``,
-    where D is the set of :class:`Dimension`s in M, and V is a set of
-    :class:`DerivedDimension`s. M'[d] provides the sub-iterators along the
+    where D is the set of Dimensions in M, and V is a set of
+    DerivedDimensions. M'[d] provides the sub-iterators along the
     Dimension `d`.
     """
     iterators = OrderedDict()
@@ -91,8 +89,8 @@ def build_iterators(mapper):
 
 def build_intervals(stencil):
     """
-    Given a :class:`Stencil`, return an iterable of :class:`Interval`s, one
-    for each :class:`Dimension` in the stencil.
+    Given a Stencil, return an iterable of Intervals, one
+    for each Dimension in the stencil.
     """
     mapper = {}
     for d, offs in stencil.items():
@@ -109,18 +107,18 @@ def align_accesses(expr, key=lambda i: False):
     """
     mapper = {}
     for indexed in retrieve_indexed(expr):
-        f = indexed.base.function
+        f = indexed.function
         if not key(f):
             continue
-        subs = {i: i + j.left for i, j in zip(indexed.indices, f._offset_domain)}
+        subs = {i: i + j for i, j in zip(indexed.indices, f._size_halo.left)}
         mapper[indexed] = indexed.xreplace(subs)
     return expr.xreplace(mapper)
 
 
 def detect_flow_directions(exprs):
     """
-    Return a mapper from :class:`Dimension`s to iterables of
-    :class:`IterationDirection`s representing the theoretically necessary
+    Return a mapper from Dimensions to Iterables of
+    IterationDirections representing the theoretically necessary
     directions to evaluate ``exprs`` so that the information "naturally
     flows" from an iteration to another.
     """
@@ -130,7 +128,7 @@ def detect_flow_directions(exprs):
     reads = flatten(retrieve_indexed(i.rhs, mode='all') for i in exprs)
     reads = [Access(i, 'R') for i in reads]
 
-    # Determine indexed-wise direction by looking at the vector distance
+    # Determine indexed-wise direction by looking at the distance vector
     mapper = defaultdict(set)
     for w in writes:
         for r in reads:
@@ -171,14 +169,19 @@ def detect_flow_directions(exprs):
     mapper.update({k.parent: set(v) for k, v in mapper.items()
                    if k.is_Derived and mapper.get(k.parent, {Any}) == {Any}})
 
+    # Add in "free" Dimensions, ie Dimensions used as symbols rather than as
+    # array indices
+    mapper.update({d: {Any} for d in flatten(i.free_symbols for i in exprs)
+                   if isinstance(d, Dimension) and d not in mapper})
+
     return mapper
 
 
 def force_directions(mapper, key):
     """
-    Return a mapper ``M : D -> I`` where D is the set of :class:`Dimension`s
+    Return a mapper ``M : D -> I`` where D is the set of Dimensions
     found in the input mapper ``M' : D -> {I}``, while I = {Any, Backward,
-    Forward} (i.e., the set of possible :class:`IterationDirection`s).
+    Forward} (i.e., the set of possible IterationDirections).
 
     The iteration direction is chosen so that the information "naturally flows"
     from an iteration to another (i.e., to generate "flow" or "read-after-write"
@@ -213,53 +216,17 @@ def force_directions(mapper, key):
     return directions, clashes
 
 
-def group_expressions(exprs):
-    """``{exprs} -> ({exprs'}, {exprs''}, ...)`` where: ::
-
-        * There are data dependences within exprs' and within exprs'';
-        * There are *no* data dependencies across exprs' and exprs''.
-    """
-    # Partion based on data dependences
-    mapper = OrderedDict()
-    ngroups = 0
-    for e1 in exprs:
-        if e1 in mapper:
-            # Optimization: we know already that a group for `e1` has been found
-            continue
-        found = False
-        for e2 in exprs:
-            if e1 is e2:
-                continue
-            elif Scope([e1, e2]).has_dep:
-                v = mapper.get(e1, mapper.get(e2))
-                if v is None:
-                    ngroups += 1
-                    v = ngroups
-                mapper[e1] = mapper[e2] = v
-                found = True
-        if not found:
-            ngroups += 1
-            mapper[e1] = ngroups
-
-    # Reorder to match input ordering
-    groups = []
-    data = sorted(mapper, key=lambda i: mapper[i])
-    for k, g in groupby(data, key=lambda i: mapper[i]):
-        groups.append(tuple(sorted(g, key=lambda i: exprs.index(i))))
-
-    # Sanity check
-    assert max(mapper.values()) == len(groups)
-
-    return tuple(groups)
-
-
 def detect_io(exprs, relax=False):
-    """``{exprs} -> ({reads}, {writes})
+    """
+    ``{exprs} -> ({reads}, {writes})
 
-    :param exprs: The expressions inspected.
-    :param relax: (Optional) if False, as by default, collect only
-                  :class:`Constant`s and :class:`Function`s. Otherwise,
-                  collect any :class:`Basic`s.
+    Parameters
+    ----------
+    exprs : expr-like or list of expr-like
+        The searched expressions.
+    relax : bool, optional
+        If False, as by default, collect only Constants and
+        Functions. Otherwise, collect any :class:`types.Basic`s.
     """
     exprs = as_tuple(exprs)
     if relax is False:

@@ -1,8 +1,7 @@
-from sympy import solve, Symbol
+from sympy import Symbol
 
-from devito import Eq, Operator, Function, TimeFunction, Inc
 from devito.cgen_utils import INT
-from devito.logger import error
+from devito import Eq, Operator, Function, TimeFunction, Inc, solve
 from examples.seismic import PointSource, Receiver
 
 
@@ -47,7 +46,7 @@ def iso_stencil(field, m, s, damp, kernel, **kwargs):
     # Add dampening field according to the propagation direction
     eq += damp * field.dt if kwargs.get('forward', True) else -damp * field.dt
     # Solve the symbolic equation for the field to be updated
-    eq_time = solve(eq, next, rational=False, simplify=False)[0]
+    eq_time = solve(eq, next)
     # Get the spacial FD
     lap = laplacian(field, m, s, kernel)
     # return the Stencil with H replaced by its symbolic expression
@@ -85,7 +84,7 @@ def A(model, source, space_order=4, kernel='OT2', **kwargs):
 
 
 
-def ForwardOperator(model, source, receiver, space_order=4,
+def ForwardOperator(model, geometry, space_order=4,
                     save=False, kernel='OT2', **kwargs):
     """
     Constructor method for the forward modelling operator in an acoustic media
@@ -100,22 +99,23 @@ def ForwardOperator(model, source, receiver, space_order=4,
 
     # Create symbols for forward wavefield, source and receivers
     u = TimeFunction(name='u', grid=model.grid,
-                     save=source.nt if save else None,
+                     save=geometry.nt if save else None,
                      time_order=2, space_order=space_order)
-    src = PointSource(name='src', grid=model.grid, time_range=source.time_range,
-                      npoint=source.npoint)
-    rec = Receiver(name='rec', grid=model.grid, time_range=receiver.time_range,
-                   npoint=receiver.npoint)
+    src = PointSource(name='src', grid=geometry.grid, time_range=geometry.time_axis,
+                      npoint=geometry.nsrc)
+
+    rec = Receiver(name='rec', grid=geometry.grid, time_range=geometry.time_axis,
+                   npoint=geometry.nrec)
 
     s = model.grid.stepping_dim.spacing
     eqn = iso_stencil(u, m, s, damp, kernel)
 
     # Construct expression to inject source values
-    src_term = src.inject(field=u.forward, expr=src * s**2 / m,
-                          offset=model.nbpml)
+    src_term = src.inject(field=u.forward, expr=src * s**2 / m)
 
     # Create interpolation expression for receivers
-    rec_term = rec.interpolate(expr=u, offset=model.nbpml)
+
+    rec_term = rec.interpolate(expr=u)
     if kwargs.get('freesurface', False):
         eqn += [Eq(u.forward.subs({u.indices[-1] : INT(i)}), -u.forward.subs({u.indices[-1] : INT(2*model.nbpml-i)})) for i in range(model.nbpml-int(space_order/2),model.nbpml)]
     # Substitute spacing terms to reduce flops
@@ -123,9 +123,8 @@ def ForwardOperator(model, source, receiver, space_order=4,
     return Operator(eqn + src_term + rec_term, subs=model.spacing_map,
                     name='Forward', **kwargs)
 
-
-def AdjointOperator(model, source, receiver, space_order=4,
-                    kernel='OT2', save=False, **kwargs):
+def AdjointOperator(model, geometry, space_order=4,
+                    kernel='OT2', **kwargs):
     """
     Constructor method for the adjoint modelling operator in an acoustic media
 
@@ -139,28 +138,26 @@ def AdjointOperator(model, source, receiver, space_order=4,
 
     v = TimeFunction(name='v', grid=model.grid, save=source.nt if save else None,
                      time_order=2, space_order=space_order)
-    srca = PointSource(name='srca', grid=model.grid, time_range=source.time_range,
-                       npoint=source.npoint)
-    rec = Receiver(name='rec', grid=model.grid, time_range=receiver.time_range,
-                   npoint=receiver.npoint)
+    srca = PointSource(name='srca', grid=model.grid, time_range=geometry.time_axis,
+                       npoint=geometry.nsrc)
+    rec = Receiver(name='rec', grid=model.grid, time_range=geometry.time_axis,
+                   npoint=geometry.nrec)
 
     s = model.grid.stepping_dim.spacing
     eqn = iso_stencil(v, m, s, damp, kernel, forward=False)
 
     # Construct expression to inject receiver values
-    receivers = rec.inject(field=v.backward, expr=rec * s**2 / m,
-                           offset=model.nbpml)
+    receivers = rec.inject(field=v.backward, expr=rec * s**2 / m)
 
     # Create interpolation expression for the adjoint-source
-    source_a = srca.interpolate(expr=v, offset=model.nbpml)
+    source_a = srca.interpolate(expr=v)
 
     # Substitute spacing terms to reduce flops
     return Operator(eqn + receivers + source_a, subs=model.spacing_map,
                     name='Adjoint', **kwargs)
 
-
-def GradientOperator(model, source, receiver, space_order=4, save=True,
-                     kernel='OT2', isic=False, **kwargs):
+def GradientOperator(model, geometry, space_order=4, save=True,
+                     kernel='OT2', **kwargs):
     """
     Constructor method for the gradient operator in an acoustic media
 
@@ -174,39 +171,35 @@ def GradientOperator(model, source, receiver, space_order=4, save=True,
 
     # Gradient symbol and wavefield symbols
     grad = Function(name='grad', grid=model.grid)
-    u = TimeFunction(name='u', grid=model.grid, save=source.nt if save
+    u = TimeFunction(name='u', grid=model.grid, save=geometry.nt if save
                      else None, time_order=2, space_order=space_order)
     v = TimeFunction(name='v', grid=model.grid, save=None,
                      time_order=2, space_order=space_order)
-    rec = Receiver(name='rec', grid=model.grid,
-                   time_range=receiver.time_range, npoint=receiver.npoint)
+    rec = Receiver(name='rec', grid=model.grid, time_range=geometry.time_axis,
+                   npoint=geometry.nrec)
 
     s = model.grid.stepping_dim.spacing
     eqn = iso_stencil(v, m, s, damp, kernel, forward=False)
 
     if kernel == 'OT2':
         if isic==False:
-            gradient_update = Inc(grad, grad - u.dt2 * v)
+            gradient_update = Inc(grad, - u.dt2 * v)
         else:
             print('Inverse scattering imaging condition')
-            gradient_update = Inc(grad, grad -(u * v.dt2 * m + u.dx * v.dx + u.dy * v.dy))
+            gradient_update = Inc(grad, -(u * v.dt2 * m + u.dx * v.dx + u.dy * v.dy))
 
     elif kernel == 'OT4':
-        gradient_update = Inc(grad, grad - (u.dt2 +
-                                           s**2 / 12.0 * u.laplace2(m**(-2))) * v)
-    else:
-        error("Unrecognized kernel, has to be OT2 or OT4")
+        gradient_update = Inc(grad, - (u.dt2 + s**2 / 12.0 * u.laplace2(m**(-2))) * v)
+
     # Add expression for receiver injection
-    receivers = rec.inject(field=v.backward, expr=rec * s**2 / m,
-                           offset=model.nbpml)
+    receivers = rec.inject(field=v.backward, expr=rec * s**2 / m)
 
     # Substitute spacing terms to reduce flops
     return Operator(eqn + receivers + [gradient_update], subs=model.spacing_map,
                     name='Gradient', **kwargs)
 
-
-def BornOperator(model, source, receiver, space_order=4,
-                 kernel='OT2', save=False, **kwargs):
+def BornOperator(model, geometry, space_order=4,
+                 kernel='OT2', **kwargs):
     """
     Constructor method for the Linearized Born operator in an acoustic media
 
@@ -219,10 +212,11 @@ def BornOperator(model, source, receiver, space_order=4,
     m, damp = model.m, model.damp
 
     # Create source and receiver symbols
-    src = PointSource(name='src', grid=model.grid, time_range=source.time_range,
-                      npoint=source.npoint)
-    rec = Receiver(name='rec', grid=model.grid, time_range=receiver.time_range,
-                   npoint=receiver.npoint)
+    src = Receiver(name='src', grid=model.grid, time_range=geometry.time_axis,
+                   npoint=geometry.nsrc)
+
+    rec = Receiver(name='rec', grid=model.grid, time_range=geometry.time_axis,
+                   npoint=geometry.nrec)
 
     # Create wavefields and a dm field
     u = TimeFunction(name="u", grid=model.grid, save=source.nt if save else None,
@@ -236,11 +230,10 @@ def BornOperator(model, source, receiver, space_order=4,
     eqn2 = iso_stencil(U, m, s, damp, kernel, q=-dm*u.dt2)
 
     # Add source term expression for u
-    source = src.inject(field=u.forward, expr=src * s**2 / m,
-                        offset=model.nbpml)
+    source = src.inject(field=u.forward, expr=src * s**2 / m)
 
     # Create receiver interpolation expression from U
-    receivers = rec.interpolate(expr=U, offset=model.nbpml)
+    receivers = rec.interpolate(expr=U)
 
     # Substitute spacing terms to reduce flops
     return Operator(eqn1 + eqn2 + source + receivers, subs=model.spacing_map,

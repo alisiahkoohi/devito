@@ -1,5 +1,9 @@
 FROM python:3.6
 
+RUN apt-get update && apt-get install -y -q \ 
+    mpich \ 
+    libmpich-dev 
+
 ADD ./requirements.txt /app/requirements.txt
 
 RUN python3 -m venv /venv && \
@@ -24,7 +28,7 @@ RUN chmod +x \
 
 WORKDIR /app
 
-ENV DEVITO_ARCH="gcc-4.9"
+ENV DEVITO_ARCH="gcc"
 ENV DEVITO_OPENMP="0"
 
 EXPOSE 8888

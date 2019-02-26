@@ -1,14 +1,22 @@
-from devito.ir.iet import Iteration, List, IterationTree, FindSections, FindSymbols
-from devito.tools import as_tuple, flatten
-from devito.types import Array
+from collections import OrderedDict
 
-__all__ = ['filter_iterations', 'retrieve_iteration_tree', 'is_foldable',
-           'compose_nodes', 'derive_parameters']
+from devito.ir.iet import (Iteration, List, IterationTree, FindSections, FindSymbols,
+                           FindNodes, Section, Expression)
+from devito.symbolics import Macro
+from devito.tools import flatten, ReducerMap
+from devito.types import Array, LocalObject
+
+__all__ = ['filter_iterations', 'retrieve_iteration_tree',
+           'compose_nodes', 'derive_parameters', 'find_affine_trees']
 
 
 def retrieve_iteration_tree(node, mode='normal'):
-    """Return a list of all :class:`Iteration` sub-trees rooted in ``node``.
-    For example, given the Iteration tree:
+    """
+    A list with all :class:`Iteration` sub-trees within an IET.
+
+    Examples
+    --------
+    Given the Iteration tree:
 
         .. code-block:: c
 
@@ -24,10 +32,14 @@ def retrieve_iteration_tree(node, mode='normal'):
 
         [(Iteration i, Iteration j, Iteration k), (Iteration i, Iteration p)]
 
-    :param node: The searched Iteration/Expression tree.
-    :param mode: Accepted values are 'normal' (default) and 'superset', in which
-                 case iteration trees that are subset of larger iteration trees
-                 are dropped.
+    Parameters
+    ----------
+    iet : Node
+        The searched Iteration/Expression tree.
+    mode : str, optional
+        - ``normal``
+        - ``superset``: Iteration trees that are subset of larger iteration trees
+                        are dropped.
     """
     assert mode in ('normal', 'superset')
 
@@ -45,8 +57,8 @@ def retrieve_iteration_tree(node, mode='normal'):
 
 def filter_iterations(tree, key=lambda i: i, stop=lambda: False):
     """
-    Given an iterable of :class:`Iteration` objects, return a new list
-    containing all items such that ``key(o)`` is True.
+    Given an iterable of :class:`Iteration`s, produce a list containing
+    all Iterations such that ``key(iteration)`` is True.
 
     This function accepts an optional argument ``stop``. This may be either a
     lambda function, specifying a stop criterium, or any of the following
@@ -58,8 +70,8 @@ def filter_iterations(tree, key=lambda i: i, stop=lambda: False):
                   all items for which ``key(o)`` is False have been encountered.
 
     It is useful to specify a ``stop`` criterium when one is searching the
-    first Iteration in an Iteration/Expression tree for which a given property
-    does not hold.
+    first Iteration in an Iteration/Expression tree which does not honour a
+    given property.
     """
     assert callable(stop) or stop in ['any', 'asap']
 
@@ -84,23 +96,8 @@ def filter_iterations(tree, key=lambda i: i, stop=lambda: False):
     return filtered
 
 
-def is_foldable(nodes):
-    """
-    Return True if the iterable ``nodes`` consists of foldable :class:`Iteration`
-    objects, False otherwise.
-    """
-    nodes = as_tuple(nodes)
-    if len(nodes) <= 1 or any(not i.is_Iteration for i in nodes):
-        return False
-    main = nodes[0]
-    return all(i.dim == main.dim and i.limits == main.limits and i.index == main.index
-               and i.properties == main.properties for i in nodes)
-
-
 def compose_nodes(nodes, retrieve=False):
-    """
-    Build an Iteration/Expression tree by nesting the nodes in ``nodes``.
-    """
+    """Build an IET by nesting ``nodes``."""
     l = list(nodes)
     tree = []
 
@@ -139,9 +136,48 @@ def derive_parameters(nodes, drop_locals=False):
     defines = [s.name for s in FindSymbols('defines').visit(nodes)]
     parameters = tuple(s for s in symbols if s.name not in defines)
 
-    # Filter out internally-allocated temporary `Array` types
+    # Drop globally-visible objects
+    parameters = [p for p in parameters if not isinstance(p, Macro)]
+
+    # Filter out locally-allocated Arrays and Objects
     if drop_locals:
         parameters = [p for p in parameters
                       if not (isinstance(p, Array) and (p._mem_heap or p._mem_stack))]
+        parameters = [p for p in parameters if not isinstance(p, LocalObject)]
 
     return parameters
+
+
+def find_affine_trees(iet):
+    """
+    Find affine trees. A tree is affine when all of the array accesses are
+    constant/affine functions of the Iteration variables and the Iteration bounds
+    are fixed (but possibly symbolic).
+
+    Parameters
+    ----------
+    iet : `Node`
+        The searched tree
+
+    Returns
+    -------
+    list of `Node`
+        Each item in the list is the root of an affine tree
+    """
+    affine = OrderedDict()
+    roots = [i for i in FindNodes(Iteration).visit(iet) if i.dim.is_Time]
+    for root in roots:
+        sections = FindNodes(Section).visit(root)
+        for section in sections:
+            for tree in retrieve_iteration_tree(section):
+                if not all(i.is_Affine for i in tree):
+                    # Non-affine array accesses not supported
+                    break
+                exprs = [i.expr for i in FindNodes(Expression).visit(tree.root)]
+                grid = ReducerMap([('', i.grid) for i in exprs if i.grid]).unique('')
+                writeto_dimensions = tuple(i.dim.root for i in tree)
+                if grid.dimensions == writeto_dimensions:
+                    affine.setdefault(section, []).append(tree)
+                else:
+                    break
+    return affine

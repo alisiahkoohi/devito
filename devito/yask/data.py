@@ -1,3 +1,4 @@
+import ctypes
 import sys
 
 import numpy as np
@@ -5,7 +6,7 @@ import numpy as np
 from devito.logger import yask as log
 from devito.tools import as_tuple
 
-from devito.yask.utils import rawpointer
+from devito.yask.utils import namespace
 
 
 class Data(object):
@@ -34,18 +35,22 @@ class Data(object):
     |                                   allocation                                     |
     ------------------------------------------------------------------------------------
 
-    :param grid: The viewed YASK grid.
-    :param shape: Shape of the data view in grid points.
-    :param dimensions: A tuple of :class:`Dimension`s, representing the
-                       dimensions of the grid.
-    :param dtype: The ``numpy.dtype`` of the raw data.
-    :param offset: (Optional) a tuple of integers representing the offset of
-                   the data view from the first allocated grid item (one item
-                   for each dimension).
+    Parameters
+    ----------
+    grid : YASK.grid
+        The YASK grid for which a view is produced.
+    shape : tuple of ints
+        Shape of the data view in grid points.
+    dimensions : tuple of Dimension
+        The Dimensions of `grid`` along which the view is produced.
+    dtype : data-type, optional
+        The data type of the raw data.
+    offset : tuple of ints, optional
+        The offset of the data view from the first allocated item in each Dimension.
 
-    .. note::
-
-        This type supports logical indexing over modulo buffered dimensions.
+    Notes
+    -----
+    This type supports logical indexing over modulo buffered dimensions.
     """
 
     # Force __rOP__ methods (OP={add,mul,...) to get arrays, not scalars, for efficiency
@@ -85,7 +90,16 @@ class Data(object):
             self.grid.set_element(val, start)
         elif isinstance(val, np.ndarray):
             log("Data: Setting full-array/block via index [%s]" % str(index))
-            self.grid.set_elements_in_slice(val, start, stop)
+            if val.shape == shape:
+                self.grid.set_elements_in_slice(val, start, stop)
+            elif len(val.shape) > len(shape):
+                raise ValueError("Data: could not broadcast input array from shape "
+                                 "%s into shape %s" % (val.shape, shape))
+            else:
+                # Emulate NumPy broadcasting
+                broadcasted = np.empty(shape=shape, dtype=val.dtype)
+                broadcasted[:] = val
+                self.grid.set_elements_in_slice(broadcasted, start, stop)
         elif all(i == j-1 for i, j in zip(shape, self.shape)):
             log("Data: Setting full-array to given scalar via single grid sweep")
             self.grid.set_all_elements_same(val)
@@ -197,7 +211,7 @@ class Data(object):
         cstart = [int(j + i) for i, j in zip(self._offset, cstart)]
         cstop = [int(j + i) for i, j in zip(self._offset, cstop)]
 
-        return cstart, cstop, cshape
+        return tuple(cstart), tuple(cstop), tuple(cshape)
 
     def _give_storage(self, target):
         """
@@ -209,7 +223,7 @@ class Data(object):
                 target.set_right_halo_size(i.name, self.get_right_halo_size(i.name))
             else:
                 # time and misc dimensions
-                target.set_alloc_size(i.name, self.get_alloc_size(i.name))
+                target.set_alloc_size(i.root.name, self.get_alloc_size(i.root.name))
         target.share_storage(self.grid)
 
     def __getattr__(self, name):
@@ -251,7 +265,7 @@ class Data(object):
 
     @property
     def rawpointer(self):
-        return rawpointer(self.grid)
+        return ctypes.cast(int(self.grid), namespace['type-grid'])
 
     def reset(self):
         """
@@ -259,7 +273,7 @@ class Data(object):
         """
         self[:] = 0.0
 
-    def view(self):
+    def view(self, *args):
         """
         View of the YASK grid in standard (i.e., Devito) row-major layout,
         returned as a :class:`numpy.ndarray`.

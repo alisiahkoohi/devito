@@ -1,22 +1,26 @@
 import pytest
-
-from conftest import EVAL, time, x, y, z, skipif_yask  # noqa
-
 import numpy as np
 
-from devito import Eq, Inc, Grid, Function, TimeFunction, Operator, Dimension  # noqa
+from conftest import EVAL, time, x, y, z, skipif  # noqa
+from devito import (Eq, Inc, Grid, Constant, Function, TimeFunction, # noqa
+                    Operator, Dimension, SubDimension)
 from devito.ir.equations import DummyEq, LoweredEq
 from devito.ir.equations.algorithms import dimension_sort
-from devito.ir.iet.nodes import Conditional, Expression, Iteration
-from devito.ir.iet.visitors import FindNodes
-from devito.ir.support.basic import IterationInstance, TimedAccess, Scope
+from devito.ir.iet import (ArrayCast, Conditional, Expression, Iteration, FindNodes,
+                           FindSymbols, retrieve_iteration_tree, filter_iterations,
+                           make_efunc)
+from devito.ir.support.basic import (IterationInstance, TimedAccess, Scope,
+                                     AFFINE, IRREGULAR)
 from devito.ir.support.space import (NullInterval, Interval, IntervalGroup,
                                      Any, Forward, Backward)
 from devito.ir.support.utils import detect_flow_directions
 from devito.symbolics import indexify
+from devito.types import Scalar
+from devito.tools import as_tuple
+
+pytestmark = skipif(['yask', 'ops'])
 
 
-@skipif_yask
 class TestVectorDistanceArithmetic(object):
 
     @pytest.fixture
@@ -178,7 +182,6 @@ class TestVectorDistanceArithmetic(object):
             assert False
 
 
-@skipif_yask
 class TestSpace(object):
 
     def test_intervals_intersection(self):
@@ -241,12 +244,12 @@ class TestSpace(object):
         nully = NullInterval(y)
         iy = Interval(y, -2, 2)
 
-        # Mixed disjoint (note: IntervalGroup input order is irrelevant)
-        assert ix.union(ix4) == IntervalGroup([ix4, ix])
+        # Mixed disjoint (note: IntervalGroup input order is relevant)
+        assert ix.union(ix4) == IntervalGroup([ix, ix4])
         assert ix.union(ix5) == Interval(x, -3, 2)
-        assert ix6.union(ix) == IntervalGroup([ix, ix6])
+        assert ix6.union(ix) == IntervalGroup([ix6, ix])
         assert ix.union(nully) == IntervalGroup([ix, nully])
-        assert ix.union(iy) == IntervalGroup([iy, ix])
+        assert ix.union(iy) == IntervalGroup([ix, iy])
         assert iy.union(ix) == IntervalGroup([iy, ix])
 
     def test_intervals_merge(self):
@@ -304,8 +307,41 @@ class TestSpace(object):
         assert ix3.subtract(ix) == ix2
 
 
-@skipif_yask
 class TestDependenceAnalysis(object):
+
+    @pytest.mark.parametrize('indexed,expected', [
+        ('u[x,y,z]', (AFFINE, AFFINE, AFFINE)),
+        ('u[x+1,y,z-1]', (AFFINE, AFFINE, AFFINE)),
+        ('u[x+1,3,z-1]', (AFFINE, AFFINE, AFFINE)),
+        ('u[sx+1,y,z-1]', (AFFINE, AFFINE, AFFINE)),
+        ('u[x+1,c,s]', (AFFINE, AFFINE, IRREGULAR)),
+        ('u[x+1,c,sc]', (AFFINE, AFFINE, AFFINE)),
+        ('u[x+1,c+1,sc*sc]', (AFFINE, AFFINE, AFFINE)),
+        ('u[x*x+1,y,z]', (IRREGULAR, AFFINE, AFFINE)),
+        ('u[x*y,y,z]', (IRREGULAR, AFFINE, AFFINE)),
+        ('u[x + z,x + y,z*z]', (IRREGULAR, IRREGULAR, IRREGULAR)),
+        ('u[x+1,u[2,2,2],z-1]', (AFFINE, IRREGULAR, AFFINE)),
+        ('u[y,x,z]', (IRREGULAR, IRREGULAR, AFFINE)),
+    ])
+    def test_index_mode_detection(self, indexed, expected):
+        """
+        Test detection of IterationInstance access modes (AFFINE vs IRREGULAR).
+
+        Proper detection of access mode is a prerequisite to any sort of
+        data dependence analysis.
+        """
+        grid = Grid(shape=(4, 4, 4))
+        x, y, z = grid.dimensions  # noqa
+
+        sx = SubDimension.middle('sx', x, 1, 1)  # noqa
+
+        u = Function(name='u', grid=grid)  # noqa
+        c = Constant(name='c')  # noqa
+        sc = Scalar(name='sc', is_const=True)  # noqa
+        s = Scalar(name='s')  # noqa
+
+        ii = IterationInstance(eval(indexed))
+        assert ii.index_mode == expected
 
     @pytest.mark.parametrize('expr,expected', [
         ('Eq(ti0[x,y,z], ti1[x,y,z])', None),
@@ -369,7 +405,7 @@ class TestDependenceAnalysis(object):
             return
         else:
             assert len(dep.cause) == 1
-            cause = dep.cause.pop()
+            cause = set(dep.cause).pop()
             assert cause.name == exp_cause
 
         # Check mode restricted to the cause
@@ -442,7 +478,7 @@ class TestDependenceAnalysis(object):
 
         for i in ['flow', 'anti', 'output']:
             for dep in getattr(scope, 'd_%s' % i):
-                item = (dep.function.name, i, str(dep.cause))
+                item = (dep.function.name, i, str(set(dep.cause)))
                 assert item in expected
                 expected.remove(item)
 
@@ -462,10 +498,9 @@ class TestDependenceAnalysis(object):
         assert all(mapper.get(i) == {Any} for i in grid.dimensions)
 
 
-@skipif_yask
-class TestIET(object):
+class TestIETConstruction(object):
 
-    def test_nodes_conditional(self, fc):
+    def test_conditional(self, fc):
         then_body = Expression(DummyEq(fc[x, y], fc[x, y] + 1))
         else_body = Expression(DummyEq(fc[x, y], fc[x, y] + 2))
         conditional = Conditional(x < 3, then_body, else_body)
@@ -479,13 +514,70 @@ else
   fc[x][y] = fc[x][y] + 2;
 }"""
 
+    @pytest.mark.parametrize("exprs,nfuncs,ntimeiters,nests", [
+        (('Eq(v[t+1,x,y], v[t,x,y] + 1)',), (1,), (2,), ('xy',)),
+        (('Eq(v[t,x,y], v[t,x-1,y] + 1)', 'Eq(v[t,x,y], v[t,x+1,y] + u[x,y])'),
+         (1, 2), (1, 1), ('xy', 'xy'))
+    ])
+    def test_make_efuncs(self, exprs, nfuncs, ntimeiters, nests):
+        """Test construction of ElementalFunctions."""
+        exprs = list(as_tuple(exprs))
+
+        grid = Grid(shape=(10, 10))
+        t = grid.stepping_dim  # noqa
+        x, y = grid.dimensions  # noqa
+
+        u = Function(name='u', grid=grid)  # noqa
+        v = TimeFunction(name='v', grid=grid)  # noqa
+
+        # List comprehension would need explicit locals/globals mappings to eval
+        for i, e in enumerate(list(exprs)):
+            exprs[i] = eval(e)
+
+        op = Operator(exprs)
+
+        # We create one ElementalFunction for each Iteration nest over space dimensions
+        efuncs = []
+        for n, tree in enumerate(retrieve_iteration_tree(op)):
+            root = filter_iterations(tree, key=lambda i: i.dim.is_Space, stop='asap')
+            efuncs.append(make_efunc('f%d' % n, root))
+
+        assert len(efuncs) == len(nfuncs) == len(ntimeiters) == len(nests)
+
+        for efunc, nf, nt, nest in zip(efuncs, nfuncs, ntimeiters, nests):
+            # Check the `efunc` parameters
+            assert all(i in efunc.parameters for i in (x.symbolic_min, x.symbolic_max))
+            assert all(i in efunc.parameters for i in (y.symbolic_min, y.symbolic_max))
+            functions = FindSymbols().visit(efunc)
+            assert len(functions) == nf
+            assert all(i in efunc.parameters for i in functions)
+            timeiters = [i for i in FindSymbols('free-symbols').visit(efunc)
+                         if i.is_Dimension and i.is_Time]
+            assert len(timeiters) == nt
+            assert all(i in efunc.parameters for i in timeiters)
+            assert len(efunc.parameters) == 4 + len(functions) + len(timeiters)
+
+            # Check there's exactly one ArrayCast for each Function
+            assert len(FindNodes(ArrayCast).visit(efunc)) == nf
+
+            # Check the loop nest structure
+            trees = retrieve_iteration_tree(efunc)
+            assert len(trees) == 1
+            tree = trees[0]
+            assert all(i.dim.name == j for i, j in zip(tree, nest))
+
+            assert efunc.make_call()
+
+
+class TestIETAnalysis(object):
+
     @pytest.mark.parametrize('exprs,atomic,parallel', [
-        (['Inc(u[gp[p, 0]+rx, gp[p, 1]+ry], u[gp[p, 0]+rx, gp[p, 1]+ry] + cx*cy*src)'],
+        (['Inc(u[gp[p, 0]+rx, gp[p, 1]+ry], cx*cy*src)'],
          ['p', 'rx', 'ry'], []),
-        (['Eq(rcv, 0)', 'Inc(rcv, rcv + cx*cy)'],
+        (['Eq(rcv, 0)', 'Inc(rcv, cx*cy)'],
          ['rx', 'ry'], ['time', 'p']),
         (['Eq(v.forward, u+1)', 'Eq(rcv, 0)',
-          'Inc(rcv, rcv + v[t, gp[p, 0]+rx, gp[p, 1]+ry]*cx*cy)'],
+          'Inc(rcv, v[t, gp[p, 0]+rx, gp[p, 1]+ry]*cx*cy)'],
          ['rx', 'ry'], ['x', 'y', 'p']),
         (['Eq(v.forward, v[t+1, x+1, y]+v[t, x, y]+v[t, x+1, y])'],
          [], ['y']),
@@ -495,7 +587,7 @@ else
          [], ['x']),
         (['Eq(v.forward, v[t+1, x, y-1]+v[t, x, y]+v[t, x, y-1])'],
          [], ['x']),
-        (['Eq(v.forward, v+1)', 'Inc(u, u+v)'],
+        (['Eq(v.forward, v+1)', 'Inc(u, v)'],
          [], ['x', 'y'])
     ])
     def test_iteration_parallelism_2d(self, exprs, atomic, parallel):
@@ -524,7 +616,7 @@ else
         for i, e in enumerate(list(exprs)):
             exprs[i] = eval(e)
 
-        op = Operator(exprs, dle='advanced')
+        op = Operator(exprs, dle='openmp')
 
         iters = FindNodes(Iteration).visit(op)
         assert all(i.is_ParallelAtomic for i in iters if i.dim.name in atomic)
@@ -533,13 +625,12 @@ else
         assert all(not i.is_Parallel for i in iters if i.dim.name not in parallel)
 
     @pytest.mark.parametrize('exprs,atomic,parallel', [
-        (['Inc(u[gp[p, 0]+rx, gp[p, 1]+ry, gp[p, 2]+rz],'
-          ' u[gp[p, 0]+rx, gp[p, 1]+ry, gp[p, 2]+rz] + cx*cy*cz*src)'],
+        (['Inc(u[gp[p, 0]+rx, gp[p, 1]+ry, gp[p, 2]+rz], cx*cy*cz*src)'],
          ['p', 'rx', 'ry', 'rz'], []),
-        (['Eq(rcv, 0)', 'Inc(rcv, rcv + cx*cy*cz)'],
+        (['Eq(rcv, 0)', 'Inc(rcv, cx*cy*cz)'],
          ['rx', 'ry', 'rz'], ['time', 'p']),
         (['Eq(v.forward, u+1)', 'Eq(rcv, 0)',
-          'Inc(rcv, rcv + v[t, gp[p, 0]+rx, gp[p, 1]+ry, gp[p, 2]+rz]*cx*cy*cz)'],
+          'Inc(rcv, v[t, gp[p, 0]+rx, gp[p, 1]+ry, gp[p, 2]+rz]*cx*cy*cz)'],
          ['rx', 'ry', 'rz'], ['x', 'y', 'z', 'p']),
         (['Eq(v.forward, v[t+1, x+1, y, z]+v[t, x, y, z]+v[t, x+1, y, z])'],
          [], ['y', 'z']),
@@ -631,7 +722,6 @@ else
         assert all(not i.is_Wrappable for i in iters if i is not time_iter)
 
 
-@skipif_yask
 class TestEquationAlgorithms(object):
 
     @pytest.mark.parametrize('expr,expected', [
@@ -656,4 +746,4 @@ class TestEquationAlgorithms(object):
 
         expr = eval(expr)
 
-        assert dimension_sort(expr, lambda i: not i.is_Time) == eval(expected)
+        assert list(dimension_sort(expr)) == eval(expected)

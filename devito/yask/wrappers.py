@@ -1,3 +1,4 @@
+import ctypes
 import os
 import warnings
 from importlib import import_module, invalidate_caches
@@ -12,30 +13,34 @@ from devito.logger import debug, yask as log, yask_warning as warning
 from devito.tools import Signer, powerset, filter_sorted
 
 from devito.yask import cfac, ofac, exit, configuration
-from devito.yask.utils import namespace, rawpointer
+from devito.yask.utils import namespace
 from devito.yask.transformer import make_yask_ast
 
 
 class YaskKernel(object):
 
     """
-    A ``YaskKernel`` wraps a YASK kernel solution.
+    A wrapper for a YASK kernel solution.
     """
 
     def __init__(self, name, yc_soln, local_grids=None):
         """
-        Write out a YASK kernel, build it using YASK's Makefiles,
+        Write out a YASK kernel, compile it using the YASK's Makefiles,
         import the corresponding SWIG-generated Python module, and finally
         create a YASK kernel solution object.
 
-        :param name: Unique name of this YaskKernel.
-        :param yc_soln: YaskCompiler solution.
-        :param local_grids: A local grid is necessary to run the YaskKernel,
-                            but its final content can be ditched. Indeed, local
-                            grids are hidden to users -- for example, they could
-                            represent temporary arrays introduced by the DSE.
-                            This parameter tells which of the ``yc_soln``'s grids
-                            are local.
+        Parameters
+        ----------
+        name : str
+            Unique name of this YaskKernel.
+        yc_soln
+            The YaskCompiler solution.
+        local_grids : list of Array, optional
+            A local grid is necessary to run the YaskKernel, but it can be
+            deallocated upon returning to Python-land.  For example, local
+            grids could be used to implement the temporary arrays introduced by
+            the DSE.  This parameter tells which of the ``yc_soln``'s grids are
+            local.
         """
         self.name = name
 
@@ -45,7 +50,7 @@ class YaskKernel(object):
         if os.path.exists(os.path.join(namespace['yask-pylib'], '%s.py' % name)):
             # Nothing to do -- the YASK solution was compiled in a previous session
             yk = import_module(name)
-            log("cache hit, `%s` imported w/o jitting" % name)
+            debug("cache hit, `%s` imported w/o jitting" % name)
         else:
             # We create and JIT compile a fresh YASK solution
 
@@ -92,10 +97,14 @@ class YaskKernel(object):
                 # The root directory of generated code files, shared libs, Python modules
                 'YASK_OUTPUT_DIR=%s' % namespace['yask-output-dir'],
                 # Pick the YASK kernel Makefile, i.e. the one under `yask/src/kernel`
-                '-C', namespace['kernel-path'], 'api'
+                '-C', namespace['kernel-path'],
+                # Make target.
+                'api'
             ]
-            # Other potentially useful args:
-            # - "EXTRA_MACROS=TRACE", -- debugging option
+            if configuration['develop-mode']:
+                args.append('check=1')   # Activate internal YASK asserts.
+                # args.append('trace=1')   # Print out verbose progress messages.
+                # args.append('trace_mem=1')   # Print out verbose mem-access messages.
             make(namespace['path'], args)
 
             # Now we must be able to import the SWIG-generated Python module
@@ -136,22 +145,22 @@ class YaskKernel(object):
         self.local_grids = {i.name: self.grids[i.name] for i in (local_grids or [])}
 
     def new_grid(self, obj):
-        """
-        Create a new YASK grid.
-        """
+        """Create a new YASK grid."""
         return self.soln.new_fixed_size_grid('%s_%d' % (obj.name, contexts.ngrids),
-                                             [str(i) for i in obj.indices],
+                                             [str(i.root) for i in obj.indices],
                                              [int(i) for i in obj.shape])  # cast np.int
 
     def pre_apply(self, toshare):
         """
         Set up the YaskKernel before it's called from within an Operator.
 
-        :param toshare: Mapper from functions to :class:`Data`s for sharing
-                        grid storage.
+        Parameters
+        ----------
+        toshare : dict
+            Mapper ``Function -> Data`` for grid-storage sharing.
         """
         # Sanity check
-        grids = {i.grid for i in toshare if i.is_TensorFunction and i.grid is not None}
+        grids = {i.grid for i in toshare if i.is_DiscreteFunction and i.grid is not None}
         assert len(grids) == 1
         grid = grids.pop()
 
@@ -198,15 +207,13 @@ class YaskKernel(object):
         self.soln.prepare_solution()
 
         # Set up auto-tuning
-        if configuration['autotuning'] is False:
+        if configuration['autotuning'].level is False:
             self.soln.reset_auto_tuner(False)
-        elif configuration['autotuning'] == 'preemptive':
+        elif configuration['autotuning'].mode == 'preemptive':
             self.soln.run_auto_tuner_now()
 
     def post_apply(self):
-        """
-        Release temporary storage and dump performance data about the last run.
-        """
+        """Release temporary storage and dump performance data about the last run."""
         # Release grid storage. Note: this *will not* cause deallocation, as these
         # grids are actually shared with the hook solution
         for i in self.grids.values():
@@ -227,7 +234,7 @@ class YaskKernel(object):
 
     @property
     def rawpointer(self):
-        return rawpointer(self.soln)
+        return ctypes.cast(int(self.soln), namespace['type-solution'])
 
     def __repr__(self):
         return "YaskKernel [%s]" % self.name
@@ -245,11 +252,15 @@ class YaskContext(Signer):
         """
         Proxy between Devito and YASK.
 
-        A ``YaskContext`` contains N :class:`YaskKernel` and M :class:`Data`,
-        which have common space and time dimensions.
+        A YaskContext contains YaskKernel and Data having common SpaceDimensions
+        and TimeDimension.
 
-        :param name: Unique name of the context.
-        :param grid: A :class:`Grid` carrying the context dimensions.
+        Parameters
+        ----------
+        name : str
+            Unique name of the context.
+        grid : Grid
+            A Grid carrying the context Dimensions.
         """
         self.name = name
         self.space_dimensions = grid.dimensions
@@ -270,10 +281,12 @@ class YaskContext(Signer):
 
     def make_grid(self, obj):
         """
-        Create and return a new :class:`Data`, a YASK grid wrapper. Memory
-        is allocated.
+        Create a Data wrapping a YASK grid. Memory is allocated.
 
-        :param obj: The :class:`Function` for which a YASK grid is allocated.
+        Parameters
+        ----------
+        obj : Function
+            The symbolic object for which a new YASK grid is created.
         """
         # 'hook' compiler solution: describes the grid
         # 'hook' kernel solution: allocates memory
@@ -291,9 +304,9 @@ class YaskContext(Signer):
             # different set of dimensions (e.g., a strict subset and/or some misc
             # dimensions). In such a case, an extra dummy grid is attached
             # `obj` examples: u(x, d), u(x, y, z)
-            dimensions = [make_yask_ast(i, yc_hook, {}) for i in self.dimensions]
+            dimensions = [make_yask_ast(i, yc_hook) for i in self.dimensions]
             yc_hook.new_grid('dummy_grid_full', dimensions)
-        dimensions = [make_yask_ast(i, yc_hook, {}) for i in obj.indices]
+        dimensions = [make_yask_ast(i.root, yc_hook) for i in obj.indices]
         yc_hook.new_grid('dummy_grid_true', dimensions)
 
         # Create 'hook' kernel solution
@@ -308,7 +321,7 @@ class YaskContext(Signer):
             elif alloc.put_local:
                 grid.set_numa_preferred(namespace['numa-put-local'])
 
-        for i, s, h in zip(obj.indices, obj.shape_allocated, obj._extent_halo):
+        for i, s, h in zip(obj.indices, obj.shape_allocated, obj._size_halo):
             if i.is_Space:
                 # Note:
                 # From the YASK docs: "If the halo is set to a value larger than
@@ -318,8 +331,8 @@ class YaskContext(Signer):
                 grid.set_right_halo_size(i.name, h.right)
             else:
                 # time and misc dimensions
-                assert grid.is_dim_used(i.name)
-                assert grid.get_alloc_size(i.name) == s
+                assert grid.is_dim_used(i.root.name)
+                assert grid.get_alloc_size(i.root.name) == s
         grid.alloc_storage()
 
         self.grids[grid.get_name()] = grid
@@ -327,9 +340,7 @@ class YaskContext(Signer):
         return grid
 
     def make_yc_solution(self, name):
-        """
-        Create and return a YASK compiler solution object.
-        """
+        """Create a YASK compiler solution."""
         yc_soln = cfac.new_solution(name)
 
         # Redirect stdout/strerr to a string or file
@@ -346,7 +357,7 @@ class YaskContext(Signer):
 
         # Apply compile-time optimizations
         if configuration['isa'] != 'cpp':
-            dimensions = [make_yask_ast(i, yc_soln, {}) for i in self.space_dimensions]
+            dimensions = [make_yask_ast(i, yc_soln) for i in self.space_dimensions]
             # Vector folding
             for i, j in zip(dimensions, configuration.yask['folding']):
                 yc_soln.set_fold_len(i, j)
@@ -358,8 +369,7 @@ class YaskContext(Signer):
 
     def make_yk_solution(self, name, yc_soln, local_grids):
         """
-        Create and return a new :class:`YaskKernel` using ``yc_soln`` as
-        compiler solution.
+        Create a YaskKernel using ``yc_soln`` as YASK compiler solution.
         """
         soln = YaskKernel(name, yc_soln, local_grids)
         self.solutions.append(soln)
@@ -396,9 +406,7 @@ class ContextManager(OrderedDict):
             return base + ((),)
 
     def dump(self):
-        """
-        Drop all known contexts and clean up the relevant YASK directories.
-        """
+        """Drop all known contexts and clean up the relevant YASK directories."""
         self.clear()
         self._partial_map.clear()
         call(['rm', '-f'] + glob(os.path.join(namespace['path'], 'yask', '*hook*')))
@@ -408,8 +416,8 @@ class ContextManager(OrderedDict):
 
     def fetch(self, dimensions, dtype):
         """
-        Fetch the :class:`YaskContext` in ``self`` uniquely identified by
-        ``dimensions`` and ``dtype``.
+        Fetch the YaskContext in ``self`` uniquely identified by ``dimensions`` and
+        ``dtype``.
         """
         key = self._getkey(None, dtype, dimensions)
 
@@ -422,8 +430,8 @@ class ContextManager(OrderedDict):
 
     def putdefault(self, grid):
         """
-        Derive a key ``K`` from the :class:`Grid` ``grid``; if ``K`` in ``self``,
-        return the existing :class:`YaskContext` ``self[K]``, otherwise create a
+        Derive a unique key ``K`` from a Grid`; if ``K`` is in ``self``,
+        return the pre-existing YaskContext ``self[K]``, otherwise create a
         new context ``C``, set ``self[K] = C`` and return ``C``.
         """
         assert grid is not None

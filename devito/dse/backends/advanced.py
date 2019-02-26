@@ -1,5 +1,3 @@
-from __future__ import absolute_import
-
 from collections import OrderedDict
 
 from devito.ir import (DataSpace, IterationSpace, Interval, IntervalGroup, Cluster,
@@ -9,7 +7,7 @@ from devito.dse.backends import BasicRewriter, dse_pass
 from devito.symbolics import Eq, estimate_cost, xreplace_constrained, iq_timeinvariant
 from devito.dse.manipulation import (common_subexprs_elimination, collect_nested,
                                      compact_temporaries)
-from devito.types import Indexed, Scalar, Array
+from devito.types import Array, Indexed, Scalar
 
 
 class AdvancedRewriter(BasicRewriter):
@@ -142,9 +140,8 @@ class AdvancedRewriter(BasicRewriter):
 
             # Build a symbolic function for /alias/
             intervals = ispace.intervals
-            shape = tuple(i.symbolic_size for i in indices)
             halo = [(abs(intervals[i].lower), abs(intervals[i].upper)) for i in indices]
-            function = Array(name=template(), shape=shape, dimensions=indices, halo=halo)
+            function = Array(name=template(), dimensions=indices, halo=halo)
             access = tuple(i - intervals[i].lower for i in indices)
             expression = Eq(Indexed(function.indexed, *access), origin)
 

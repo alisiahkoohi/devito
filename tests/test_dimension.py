@@ -1,26 +1,31 @@
+from itertools import product
+
 import numpy as np
-
+from sympy import And
 import pytest
-from conftest import skipif_yask, configuration_override
 
-from devito import (ConditionalDimension, Grid, Function, TimeFunction, Eq, Operator,  # noqa
-                    Constant, SubDimension, DOMAIN, INTERIOR)
+from conftest import skipif
+from devito import (ConditionalDimension, Grid, Function, TimeFunction, SparseFunction,  # noqa
+                    Eq, Operator, Constant, SubDimension, switchconfig)
 from devito.ir.iet import Iteration, FindNodes, retrieve_iteration_tree
 
 
+@skipif('ops')
 class TestSubDimension(object):
 
     def test_interior(self):
         """
         Tests application of an Operator consisting of a single equation
-        over the ``INTERIOR`` region.
+        over the ``interior`` subdomain.
         """
         grid = Grid(shape=(4, 4, 4))
         x, y, z = grid.dimensions
 
+        interior = grid.interior
+
         u = TimeFunction(name='u', grid=grid)
 
-        eqn = [Eq(u.forward, u + 2, region=INTERIOR)]
+        eqn = [Eq(u.forward, u + 2, subdomain=interior)]
 
         op = Operator(eqn, dle='noop')
         op.apply(time_M=2)
@@ -30,20 +35,21 @@ class TestSubDimension(object):
         assert np.all(u.data[1, :, :, 0] == 0.)
         assert np.all(u.data[1, :, :, -1] == 0.)
 
-    @skipif_yask
+    @skipif('yask')
     def test_domain_vs_interior(self):
         """
         Tests application of an Operator consisting of two equations, one
-        over the (default) ``DOMAIN`` region, and one over the (smaller)
-        ``INTERIOR`` region.
+        over the whole domain (default), and one over the ``interior`` subdomain.
         """
         grid = Grid(shape=(4, 4, 4))
         x, y, z = grid.dimensions
         t = grid.stepping_dim  # noqa
 
+        interior = grid.interior
+
         u = TimeFunction(name='u', grid=grid)  # noqa
         eqs = [Eq(u.forward, u + 1),
-               Eq(u.forward, u.forward + 2, region=INTERIOR)]
+               Eq(u.forward, u.forward + 2, subdomain=interior)]
 
         op = Operator(eqs, dse='noop', dle='noop')
         trees = retrieve_iteration_tree(op)
@@ -119,11 +125,11 @@ class TestSubDimension(object):
                    for i in range(1, thickness + 1))
         assert np.all(u.data[0, thickness:-thickness, thickness:-thickness] == 1.)
 
-    @skipif_yask
+    @skipif('yask')
     def test_flow_detection_interior(self):
         """
         Test detection of flow directions when :class:`SubDimension`s are used
-        (in this test they are induced by the ``INTERIOR`` region).
+        (in this test they are induced by the ``interior`` subdomain).
 
         Stencil uses values at new timestep as well as those at previous ones
         This forces an evaluation order onto x.
@@ -141,14 +147,17 @@ class TestSubDimension(object):
                         v  /    v    /   v   /
         t=1            44 -+--- 11 -+--- 2--+ -- 0
         """
-
         grid = Grid(shape=(10, 10))
         x, y = grid.dimensions
+
+        interior = grid.interior
+
         u = TimeFunction(name='u', grid=grid, save=10, time_order=1, space_order=0)
+
         step = Eq(u.forward, 2*u
                   + 3*u.subs(x, x+x.spacing)
                   + 4*u.forward.subs(x, x+x.spacing),
-                  region=INTERIOR)
+                  subdomain=interior)
         op = Operator(step)
 
         u.data[0, 5, 5] = 1.0
@@ -159,32 +168,35 @@ class TestSubDimension(object):
         assert u.data[1, 2, 5] == 4*44
         assert u.data[1, 1, 5] == 4*4*44
 
-        # This point isn't updated because of the INTERIOR selection
+        # This point isn't updated because of the `interior` selection
         assert u.data[1, 0, 5] == 0
 
         assert np.all(u.data[1, 6:, :] == 0)
         assert np.all(u.data[1, :, 0:5] == 0)
         assert np.all(u.data[1, :, 6:] == 0)
 
-    @skipif_yask
+    @skipif('yask')
     @pytest.mark.parametrize('exprs,expected,', [
         # Carried dependence in both /t/ and /x/
-        (['Eq(u[t+1, x, y], u[t+1, x-1, y] + u[t, x, y], region=DOMAIN)'], 'y'),
-        (['Eq(u[t+1, x, y], u[t+1, x-1, y] + u[t, x, y], region=INTERIOR)'], 'yi'),
+        (['Eq(u[t+1, x, y], u[t+1, x-1, y] + u[t, x, y])'], 'y'),
+        (['Eq(u[t+1, x, y], u[t+1, x-1, y] + u[t, x, y], subdomain=interior)'], 'yi'),
         # Carried dependence in both /t/ and /y/
-        (['Eq(u[t+1, x, y], u[t+1, x, y-1] + u[t, x, y], region=DOMAIN)'], 'x'),
-        (['Eq(u[t+1, x, y], u[t+1, x, y-1] + u[t, x, y], region=INTERIOR)'], 'xi'),
+        (['Eq(u[t+1, x, y], u[t+1, x, y-1] + u[t, x, y])'], 'x'),
+        (['Eq(u[t+1, x, y], u[t+1, x, y-1] + u[t, x, y], subdomain=interior)'], 'xi'),
         # Carried dependence in /y/, leading to separate /y/ loops, one
         # going forward, the other backward
-        (['Eq(u[t+1, x, y], u[t+1, x, y-1] + u[t, x, y], region=INTERIOR)',
-          'Eq(u[t+1, x, y], u[t+1, x, y+1] + u[t, x, y], region=INTERIOR)'], 'xi'),
+        (['Eq(u[t+1, x, y], u[t+1, x, y-1] + u[t, x, y], subdomain=interior)',
+          'Eq(u[t+1, x, y], u[t+1, x, y+1] + u[t, x, y], subdomain=interior)'], 'xi'),
     ])
     def test_iteration_property_parallel(self, exprs, expected):
         """Tests detection of sequental and parallel Iterations when applying
-        equations over different regions."""
+        equations over different subdomains."""
         grid = Grid(shape=(20, 20))
         x, y = grid.dimensions  # noqa
         t = grid.time_dim  # noqa
+
+        interior = grid.interior  # noqa
+
         u = TimeFunction(name='u', grid=grid, save=10, time_order=1)  # noqa
 
         # List comprehension would need explicit locals/globals mappings to eval
@@ -196,7 +208,7 @@ class TestSubDimension(object):
         assert all(i.is_Sequential for i in iterations if i.dim.name != expected)
         assert all(i.is_Parallel for i in iterations if i.dim.name == expected)
 
-    @skipif_yask
+    @skipif('yask')
     @pytest.mark.parametrize('exprs,expected,', [
         (['Eq(u[t, x, yleft], u[t, x, yleft] + 1.)'], ['yleft']),
         # All outers are parallel, carried dependence in `yleft`, so no SIMD in `yleft`
@@ -376,8 +388,31 @@ class TestSubDimension(object):
         assert np.all(u.data[0, thickness:] == 0)
         assert np.all(u.data[0, :, thickness+12:] == 0)
 
+    def test_subdim_fd(self):
+        """
+        Test that the FD shortcuts are handled correctly with SubDimensions
+        """
+        grid = Grid(shape=(20, 20))
+        x, y = grid.dimensions
 
-@skipif_yask
+        u = TimeFunction(name='u', save=None, grid=grid, space_order=1, time_order=1)
+        u.data[:] = 2.
+
+        # Flows inward (i.e. forward) rather than outward
+        eq = [Eq(u.forward, u.dx + u.dy, subdomain=grid.interior)]
+
+        op = Operator(eq)
+
+        op.apply(time_M=0)
+
+        assert np.all(u.data[1, -1, :] == 2.)
+        assert np.all(u.data[1, :, 0] == 2.)
+        assert np.all(u.data[1, :, -1] == 2.)
+        assert np.all(u.data[1, 0, :] == 2.)
+        assert np.all(u.data[1, 1:18, 1:18] == 0.)
+
+
+@skipif(['yask', 'ops'])
 class TestConditionalDimension(object):
 
     """A collection of tests to check the correct functioning of
@@ -434,8 +469,35 @@ class TestConditionalDimension(object):
         # Verify that u2[x,y]= u[2*x, 2*y]
         assert np.allclose(u.data[:-1, 0:-1:2, 0:-1:2], u2.data[:-1, :, :])
 
+    def test_subsampled_fd(self):
+        """
+        Test that the FD shortcuts are handled correctly with ConditionalDimensions
+        """
+        grid = Grid(shape=(21, 21))
+        time = grid.time_dim
+        # Creates subsampled spatial dimensions and accordine grid
+        dims = tuple([ConditionalDimension(d.name+'sub', parent=d, factor=2)
+                      for d in grid.dimensions])
+        grid2 = Grid((6, 6), dimensions=dims, time_dimension=time)
+        u2 = TimeFunction(name='u2', grid=grid2, space_order=2, time_order=1)
+        u2.data.fill(2.)
+        eqns = [Eq(u2.forward, u2.dx + u2.dy)]
+        op = Operator(eqns)
+        op.apply(time_M=0, x_M=11, y_M=11)
+        # Verify that u2 contains subsampled fd values
+        assert np.all(u2.data[0, :, :] == 2.)
+        assert np.all(u2.data[1, 0, 0] == 20.)
+        assert np.all(u2.data[1, -1, -1] == -20.)
+        assert np.all(u2.data[1, 0, -1] == 0.)
+        assert np.all(u2.data[1, -1, 0] == -0.)
+        assert np.all(u2.data[1, 1:-1, 0] == 10.)
+        assert np.all(u2.data[1, 0, 1:-1] == 10.)
+        assert np.all(u2.data[1, 1:-1, -1] == -10.)
+        assert np.all(u2.data[1, -1, 1:-1] == -10.)
+        assert np.all(u2.data[1, 1:4, 1:4] == 0.)
+
     # This test generates an openmp loop form which makes older gccs upset
-    @configuration_override("openmp", False)
+    @switchconfig(openmp=False)
     def test_nothing_in_negative(self):
         """Test the case where when the condition is false, there is nothing to do."""
         nt = 4
@@ -570,3 +632,51 @@ class TestConditionalDimension(object):
         # with u[t] = t
         # v = 16 * 1 + 64 * 2 + 144 * 3 + 256 * 4 = 1600
         assert np.all(np.allclose(v.data, 1600))
+
+    def test_no_index_sparse(self):
+        """Test behaviour when the ConditionalDimension is used as a symbol in
+        an expression over sparse data objects."""
+        grid = Grid(shape=(4, 4), extent=(3.0, 3.0))
+        time = grid.time_dim
+
+        f = TimeFunction(name='f', grid=grid, save=1)
+        f.data[:] = 0.
+
+        coordinates = [(0.5, 0.5), (0.5, 2.5), (2.5, 0.5), (2.5, 2.5)]
+        sf = SparseFunction(name='sf', grid=grid, npoint=4, coordinates=coordinates)
+        sf.data[:] = 1.
+        sd = sf.dimensions[sf._sparse_position]
+
+        # We want to write to `f` through `sf` so that we obtain the
+        # following 4x4 grid (the '*' show the position of the sparse points)
+        # We do that by emulating an injection
+        #
+        # 0 --- 0 --- 0 --- 0
+        # |  *  |     |  *  |
+        # 0 --- 1 --- 1 --- 0
+        # |     |     |     |
+        # 0 --- 1 --- 1 --- 0
+        # |  *  |     |  *  |
+        # 0 --- 0 --- 0 --- 0
+
+        radius = 1
+        indices = [(i, i+radius) for i in sf._coordinate_indices]
+        bounds = [i.symbolic_size - radius for i in grid.dimensions]
+
+        eqs = []
+        for e, i in enumerate(product(*indices)):
+            args = [j > 0 for j in i]
+            args.extend([j < k for j, k in zip(i, bounds)])
+            condition = And(*args, evaluate=False)
+            cd = ConditionalDimension('sfc%d' % e, parent=sd, condition=condition)
+            index = [time] + list(i)
+            eqs.append(Eq(f[index], f[index] + sf[cd]))
+
+        op = Operator(eqs)
+        op.apply(time=0)
+
+        assert np.all(f.data[0, 1:-1, 1:-1] == 1.)
+        assert np.all(f.data[0, 0] == 0.)
+        assert np.all(f.data[0, -1] == 0.)
+        assert np.all(f.data[0, :, 0] == 0.)
+        assert np.all(f.data[0, :, -1] == 0.)

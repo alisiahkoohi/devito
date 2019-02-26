@@ -1,62 +1,38 @@
-from __future__ import absolute_import
-
 from devito.core.autotuning import autotune
-from devito.cgen_utils import printmark
-from devito.ir.iet import List, Transformer, filter_iterations, retrieve_iteration_tree
 from devito.ir.support import align_accesses
-from devito.operator import OperatorRunnable
-from devito.tools import flatten
+from devito.parameters import configuration
+from devito.operator import Operator
 
-__all__ = ['Operator']
+__all__ = ['OperatorCore']
 
 
-class OperatorCore(OperatorRunnable):
+class OperatorCore(Operator):
 
     def _specialize_exprs(self, expressions):
         # Align data accesses to the computational domain
-        key = lambda i: i.is_TensorFunction
+        key = lambda i: i.is_DiscreteFunction
         expressions = [align_accesses(e, key=key) for e in expressions]
         return super(OperatorCore, self)._specialize_exprs(expressions)
 
-    def _autotune(self, args):
-        """
-        Use auto-tuning on this Operator to determine empirically the
-        best block sizes when loop blocking is in use.
-        """
-        if self._dle_flags.get('blocking', False):
-            return autotune(self, args, self.parameters, self._dle_args)
-        else:
+    def _autotune(self, args, setup):
+        if setup is False:
             return args
+        elif setup is True:
+            level = configuration['autotuning'].level or 'basic'
+            args, summary = autotune(self, args, level, configuration['autotuning'].mode)
+        elif isinstance(setup, str):
+            args, summary = autotune(self, args, setup, configuration['autotuning'].mode)
+        elif isinstance(setup, tuple) and len(setup) == 2:
+            level, mode = setup
+            if level is False:
+                return args
+            else:
+                args, summary = autotune(self, args, level, mode)
+        else:
+            raise ValueError("Expected bool, str, or 2-tuple, got `%s` instead"
+                             % type(setup))
 
+        # Record the tuned values
+        self._state.setdefault('autotuning', []).append(summary)
 
-class OperatorDebug(OperatorCore):
-    """
-    Decorate the generated code with useful print statements.
-    """
-
-    def __init__(self, expressions, **kwargs):
-        super(OperatorDebug, self).__init__(expressions, **kwargs)
-        self._includes.append('stdio.h')
-
-        # Minimize the trip count of the sequential loops
-        iterations = set(flatten(retrieve_iteration_tree(self.body)))
-        mapper = {i: i._rebuild(limits=(max(i.offsets) + 2))
-                  for i in iterations if i.is_Sequential}
-        self.body = Transformer(mapper).visit(self.body)
-
-        # Mark entry/exit points of each non-sequential Iteration tree in the body
-        iterations = [filter_iterations(i, lambda i: not i.is_Sequential, 'any')
-                      for i in retrieve_iteration_tree(self.body)]
-        iterations = [i[0] for i in iterations if i]
-        mapper = {t: List(header=printmark('In nest %d' % i), body=t)
-                  for i, t in enumerate(iterations)}
-        self.body = Transformer(mapper).visit(self.body)
-
-
-class Operator(object):
-
-    def __new__(cls, *args, **kwargs):
-        cls = OperatorDebug if kwargs.pop('debug', False) else OperatorCore
-        obj = cls.__new__(cls, *args, **kwargs)
-        obj.__init__(*args, **kwargs)
-        return obj
+        return args

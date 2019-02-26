@@ -1,6 +1,6 @@
 from collections import OrderedDict
 
-from devito.dle.backends import AdvancedRewriter, Ompizer
+from devito.dle import AdvancedRewriter, Ompizer
 from devito.ir.iet import Expression, FindNodes, Transformer
 from devito.logger import yask_warning as warning
 
@@ -12,10 +12,8 @@ __all__ = ['YaskRewriter']
 class YaskOmpizer(Ompizer):
 
     def _make_parallel_tree(self, root, candidates):
-        """
-        Return a mapper to parallelize the :class:`Iteration`s within /root/.
-        """
-        parallel = self._pragma_for(root, candidates)
+        ncollapse = self._ncollapse(root, candidates)
+        parallel = self.lang['for'](ncollapse)
 
         yask_add = namespace['code-grid-add']
 
@@ -25,7 +23,7 @@ class YaskOmpizer(Ompizer):
             # Turn increments into atomic increments
             subs = {}
             for e in FindNodes(Expression).visit(root):
-                if not e.is_increment:
+                if not e.is_Increment:
                     continue
                 # Try getting the increment components
                 try:
@@ -46,10 +44,10 @@ class YaskOmpizer(Ompizer):
 
 class YaskRewriter(AdvancedRewriter):
 
-    _parallelizer = YaskOmpizer
+    _shm_parallelizer_type = YaskOmpizer
 
     def _pipeline(self, state):
         self._avoid_denormals(state)
         self._loop_wrapping(state)
         if self.params['openmp'] is True:
-            self._parallelize(state)
+            self._shm_parallelize(state)

@@ -3,40 +3,29 @@ from itertools import islice
 
 from cached_property import cached_property
 
-from devito.dimension import Dimension
-from devito.symbolics import (Eq, as_symbol, retrieve_indexed, retrieve_terminals,
-                              convert_to_SSA, q_inc, q_indirect, q_timedimension)
+from devito.ir.equations import ClusterizedEq
+from devito.symbolics import (as_symbol, retrieve_indexed, retrieve_terminals,
+                              q_indirect, q_timedimension)
 from devito.tools import DefaultOrderedDict, flatten, filter_ordered
+from devito.types import Dimension, Symbol
 
 __all__ = ['FlowGraph']
 
 
-class Node(Eq):
+class Node(ClusterizedEq):
 
     """
-    A special :class:`sympy.Eq` which keeps track of: ::
+    A special ClusterizedEq which keeps track of: ::
 
-        - :class:`sympy.Eq` writing to ``self``
-        - :class:`sympy.Eq` reading from ``self``
+        - Equations writing to ``self``
+        - Equations reading from ``self``
     """
 
-    def __new__(cls, lhs, rhs, **kwargs):
-        reads = kwargs.pop('reads', [])
-        readby = kwargs.pop('readby', [])
-        inc = kwargs.pop('inc', False)
-        obj = super(Node, cls).__new__(cls, lhs, rhs, **kwargs)
-        obj._is_Increment = inc
-        obj._reads = set(reads)
-        obj._readby = set(readby)
-        return obj
+    _state = ClusterizedEq._state + ('reads', 'readby')
 
     @property
     def function(self):
-        return self.lhs.base.function
-
-    @property
-    def is_Increment(self):
-        return self._is_Increment
+        return self.lhs.function
 
     @property
     def reads(self):
@@ -47,12 +36,8 @@ class Node(Eq):
         return self._readby
 
     @property
-    def is_tensor(self):
-        return self.lhs.is_Indexed and self.lhs.rank > 0
-
-    @property
-    def is_scalar(self):
-        return not self.is_tensor
+    def is_unbound_temporary(self):
+        return self.function.is_Array and not self.reads and not self.readby
 
     def __repr__(self):
         reads = '[%s%s]' % (', '.join([str(i) for i in self.reads][:2]), '%s')
@@ -61,15 +46,12 @@ class Node(Eq):
         readby = readby % ('' if len(self.readby) <= 2 else ', ...')
         return "Node(key=%s, reads=%s, readby=%s)" % (self.lhs, reads, readby)
 
-    def func(self, *args, **kwargs):
-        return super(Node, self).func(*args, inc=self.is_Increment, **kwargs)
-
 
 class FlowGraph(OrderedDict):
 
     """
-    A FlowGraph represents an ordered sequence of operations. Operations,
-    of type :class:`Node`, are the nodes of the graph. An edge from ``n0`` to
+    A FlowGraph represents an ordered sequence of operations. The operations,
+    objects of type Node, are the nodes of the graph. An edge from ``n0`` to
     ``n1`` indicates that ``n1`` reads from ``n0``. For example, the sequence: ::
 
         temp0 = a*b
@@ -94,7 +76,7 @@ class FlowGraph(OrderedDict):
 
     def __init__(self, exprs, **kwargs):
         # Always convert to SSA
-        exprs = convert_to_SSA(exprs)
+        exprs = makeit_ssa(exprs)
         mapper = OrderedDict([(i.lhs, i) for i in exprs])
         assert len(set(mapper)) == len(exprs), "not SSA Cluster?"
 
@@ -115,12 +97,12 @@ class FlowGraph(OrderedDict):
             for i in reads[k]:
                 readby[i].add(k)
 
-        # Make sure read-after-writes are honored for scalar temporaries
+        # Make sure read-after-writes are honored for scalar nodes
         processed = [i for i in mapper if i.is_Indexed]
         queue = [i for i in mapper if i not in processed]
         while queue:
             k = queue.pop(0)
-            if not readby[k]:
+            if not readby[k] or k in readby[k]:
                 processed.insert(0, k)
             elif all(i in processed for i in readby[k]):
                 index = min(processed.index(i) for i in readby[k])
@@ -129,20 +111,19 @@ class FlowGraph(OrderedDict):
                 queue.append(k)
 
         # Build up the FlowGraph
-        temporaries = [(i, Node(*mapper[i].args, inc=q_inc(mapper[i]),
-                                reads=reads[i], readby=readby[i]))
-                       for i in processed]
-        super(FlowGraph, self).__init__(temporaries, **kwargs)
+        nodes = [(i, Node(mapper[i], reads=reads[i], readby=readby[i]))
+                 for i in processed]
+        super(FlowGraph, self).__init__(nodes, **kwargs)
 
         # Determine indices along the space and time dimensions
-        terms = [v for k, v in self.items() if v.is_tensor and not q_indirect(k)]
+        terms = [v for k, v in self.items() if v.is_Tensor and not q_indirect(k)]
         indices = filter_ordered(flatten([i.function.indices for i in terms]))
         self.space_indices = tuple(i for i in indices if i.is_Space)
         self.time_indices = tuple(i for i in indices if i.is_Time)
 
     def trace(self, key, readby=False, strict=False):
         """
-        Return the sequence of operations required to compute the temporary ``key``.
+        Return the sequence of operations required to compute the node ``key``.
         If ``readby = True``, then return the sequence of operations that will
         depend on ``key``, instead. With ``strict = True``, drop ``key`` from the
         result.
@@ -151,7 +132,7 @@ class FlowGraph(OrderedDict):
             return []
 
         # OrderedDicts, besides preserving the scheduling order, also prevent
-        # scheduling the same temporary more than once
+        # scheduling the same node more than once
         found = OrderedDict()
         queue = OrderedDict([(key, self[key])])
         while queue:
@@ -162,10 +143,10 @@ class FlowGraph(OrderedDict):
                 found[k] = v
             else:
                 # Tensors belong to other traces, so they can be scheduled straight away
-                tensors = [i for i in reads if i.is_tensor]
+                tensors = [i for i in reads if i.is_Tensor]
                 found = OrderedDict(list(found.items()) + [(i.lhs, i) for i in tensors])
-                # Postpone the rest until all dependening temporaries got scheduled
-                scalars = [i for i in reads if i.is_scalar]
+                # Postpone the rest until all dependening nodes got scheduled
+                scalars = [i for i in reads if i.is_Scalar]
                 queue = OrderedDict([(i.lhs, i) for i in scalars] +
                                     [(k, v)] + list(queue.items()))
         if strict is True:
@@ -189,7 +170,7 @@ class FlowGraph(OrderedDict):
         seen = set()
         while queue:
             item = queue.pop()
-            temporaries = set()
+            nodes = set()
             for i in retrieve_terminals(item):
                 if i in seen:
                     # Already inspected, nothing more can be inferred
@@ -199,16 +180,16 @@ class FlowGraph(OrderedDict):
                     return False
                 elif i in self:
                     # Go on with the search
-                    temporaries.add(i)
+                    nodes.add(i)
                 elif isinstance(i, Dimension):
                     # Go on with the search, as /i/ is not a time dimension
                     pass
-                elif not i.base.function.is_TensorFunction:
+                elif not i.function.is_DiscreteFunction:
                     # It didn't come from the outside and it's not in self, so
                     # cannot determine if time-invariant; assume time-varying
                     return False
                 seen.add(i)
-            queue.extend([self[i].rhs for i in temporaries])
+            queue.extend([self[i].rhs for i in nodes])
         return True
 
     def is_index(self, key):
@@ -218,7 +199,7 @@ class FlowGraph(OrderedDict):
         """
         if key not in self:
             return False
-        match = key.base.label if self[key].is_tensor else key
+        match = key.base.label if self[key].is_Tensor else key
         for i in self.extract(key, readby=True):
             for e in retrieve_indexed(i):
                 if any(match in idx.free_symbols for idx in e.indices):
@@ -228,12 +209,12 @@ class FlowGraph(OrderedDict):
     def extract(self, key, readby=False):
         """
         Return the list of nodes appearing in ``key.reads``, in program order
-        (ie, based on the order in which the temporaries appear in ``self``). If
+        (ie, based on the order in which the nodes appear in ``self``). If
         ``readby is True``, then return instead the list of nodes appearing
         ``key.readby``, in program order.
 
         Examples
-        ========
+        --------
         Given the following sequence of operations: ::
 
             t1 = ...
@@ -244,7 +225,7 @@ class FlowGraph(OrderedDict):
             t2 = ...
 
         Assuming ``key == v`` and ``readby is False`` (as by default), return
-        the following list of :class:`Node` objects: ::
+        the following list of Node objects: ::
 
             [t1, t0, u[i, j], u[3, j]]
 
@@ -278,10 +259,10 @@ class FlowGraph(OrderedDict):
     @cached_property
     def unknown(self):
         """
-        Return all symbols appearing in self for which a temporary is not available.
+        Return all symbols appearing in self for which a node is not available.
         """
         known = {v.function for v in self.values()}
-        reads = set([i.base.function for i in
+        reads = set([i.function for i in
                      flatten(retrieve_terminals(v.rhs) for v in self.values())])
         return reads - known
 
@@ -294,8 +275,39 @@ class FlowGraph(OrderedDict):
         for v in self.values():
             handle = retrieve_indexed(v)
             for i in handle:
-                found = mapper.setdefault(i.base.function, [])
+                found = mapper.setdefault(i.function, [])
                 if i not in found:
                     # Not using sets to preserve order
                     found.append(i)
         return mapper
+
+
+def makeit_ssa(exprs):
+    """Convert an iterable of Eqs into Static Single Assignment (SSA) form."""
+    # Identify recurring LHSs
+    seen = {}
+    for i, e in enumerate(exprs):
+        seen.setdefault(e.lhs, []).append(i)
+    # Optimization: don't waste time reconstructing stuff if already in SSA form
+    if all(len(i) == 1 for i in seen.values()):
+        return exprs
+    # SSA conversion
+    c = 0
+    mapper = {}
+    processed = []
+    for i, e in enumerate(exprs):
+        where = seen[e.lhs]
+        rhs = e.rhs.xreplace(mapper)
+        if len(where) > 1:
+            needssa = e.is_Scalar or where[-1] != i
+            lhs = Symbol(name='ssa%d' % c, dtype=e.dtype) if needssa else e.lhs
+            if e.is_Increment:
+                # Turn AugmentedAssignment into Assignment
+                processed.append(e.func(lhs, mapper[e.lhs] + rhs, is_Increment=False))
+            else:
+                processed.append(e.func(lhs, rhs))
+            mapper[e.lhs] = lhs
+            c += 1
+        else:
+            processed.append(e.func(e.lhs, rhs))
+    return processed

@@ -9,8 +9,9 @@ from sympy.functions.elementary.trigonometric import TrigonometricFunction
 
 from devito.tools import Pickable, as_tuple
 
-__all__ = ['FrozenExpr', 'Eq', 'CondEq', 'CondNe', 'Mul', 'Add', 'IntDiv',
-           'FunctionFromPointer', 'ListInitializer', 'taylor_sin', 'taylor_cos',
+__all__ = ['FrozenExpr', 'Eq', 'CondEq', 'CondNe', 'Mul', 'Add', 'Pow', 'IntDiv',
+           'FunctionFromPointer', 'FieldFromPointer', 'FieldFromComposite',
+           'ListInitializer', 'Byref', 'Macro', 'taylor_sin', 'taylor_cos',
            'bhaskara_sin', 'bhaskara_cos']
 
 
@@ -42,6 +43,9 @@ class FrozenExpr(Expr):
                 return self.func(*args, evaluate=False)
         return self
 
+    def evalf(self, *args, **kwargs):
+        return self
+
 
 class Eq(sympy.Eq, FrozenExpr):
 
@@ -58,6 +62,10 @@ class CondEq(sympy.Eq, FrozenExpr):
     def __new__(cls, *args, **kwargs):
         return sympy.Eq.__new__(cls, *args, evaluate=False)
 
+    @property
+    def canonical(self):
+        return self
+
 
 class CondNe(sympy.Ne, FrozenExpr):
     """A customized version of :class:`sympy.Ne` representing a conditional
@@ -66,13 +74,24 @@ class CondNe(sympy.Ne, FrozenExpr):
     def __new__(cls, *args, **kwargs):
         return sympy.Ne.__new__(cls, *args, evaluate=False)
 
+    @property
+    def canonical(self):
+        return self
+
 
 class Mul(sympy.Mul, FrozenExpr):
-    pass
+    def __new__(cls, *args, **kwargs):
+        return sympy.Mul.__new__(cls, *args, evaluate=False)
 
 
 class Add(sympy.Add, FrozenExpr):
-    pass
+    def __new__(cls, *args, **kwargs):
+        return sympy.Add.__new__(cls, *args, evaluate=False)
+
+
+class Pow(sympy.Pow, FrozenExpr):
+    def __new__(cls, *args, **kwargs):
+        return sympy.Pow.__new__(cls, *args, evaluate=False)
 
 
 class IntDiv(sympy.Expr):
@@ -89,10 +108,15 @@ class IntDiv(sympy.Expr):
 
     def __new__(cls, lhs, rhs, params=None):
         rhs = Integer(rhs)
-        obj = sympy.Expr.__new__(cls, lhs, rhs)
-        obj.lhs = lhs
-        obj.rhs = rhs
-        return obj
+        if rhs == 0:
+            raise ValueError("Cannot divide by 0")
+        elif rhs == 1:
+            return lhs
+        else:
+            obj = sympy.Expr.__new__(cls, lhs, rhs)
+            obj.lhs = lhs
+            obj.rhs = rhs
+            return obj
 
     def __str__(self):
         return "%s / %s" % (self.lhs, self.rhs)
@@ -110,8 +134,6 @@ class FunctionFromPointer(sympy.Expr, Pickable):
         args = []
         if isinstance(pointer, str):
             pointer = Symbol(pointer)
-        elif not isinstance(pointer, Expr):
-            raise ValueError("`pointer` must be Expr or str")
         args.append(pointer)
         if isinstance(function, FunctionFromPointer):
             args.append(function)
@@ -156,6 +178,55 @@ class FunctionFromPointer(sympy.Expr, Pickable):
     __reduce_ex__ = Pickable.__reduce_ex__
 
 
+class FieldFromPointer(FunctionFromPointer, Pickable):
+
+    """
+    Symbolic representation of the C notation ``pointer->field``.
+    """
+
+    def __new__(cls, field, pointer):
+        return FunctionFromPointer.__new__(cls, field, pointer)
+
+    def __str__(self):
+        return '%s->%s' % (self.pointer, self.field)
+
+    @property
+    def field(self):
+        return self.function
+
+    # Our __new__ cannot accept the params argument
+    _pickle_kwargs = []
+
+    __repr__ = __str__
+
+
+class FieldFromComposite(FunctionFromPointer, Pickable):
+
+    """
+    Symbolic representation of the C notation ``composite.field``,
+    where ``composite`` is a struct/union/...
+    """
+
+    def __new__(cls, field, composite):
+        return FunctionFromPointer.__new__(cls, field, composite)
+
+    def __str__(self):
+        return '%s.%s' % (self.composite, self.field)
+
+    @property
+    def field(self):
+        return self.function
+
+    @property
+    def composite(self):
+        return self.pointer
+
+    # Our __new__ cannot accept the params argument
+    _pickle_kwargs = []
+
+    __repr__ = __str__
+
+
 class ListInitializer(sympy.Expr, Pickable):
 
     """
@@ -183,6 +254,32 @@ class ListInitializer(sympy.Expr, Pickable):
     # Pickling support
     _pickle_args = ['params']
     __reduce_ex__ = Pickable.__reduce_ex__
+
+
+class Byref(sympy.Symbol, Pickable):
+
+    """
+    Symbolic representation of the C++ notation ``&symbol``.
+    """
+
+    def __new__(cls, name):
+        return sympy.Symbol.__new__(cls, name)
+
+    def __str__(self):
+        return "&%s" % self.name
+
+    __repr__ = __str__
+
+    # Pickling support
+    _pickle_args = ['name']
+    __reduce_ex__ = Pickable.__reduce_ex__
+
+
+class Macro(sympy.Symbol):
+    """
+    Symbolic representation of a C++ macro.
+    """
+    pass
 
 
 class taylor_sin(TrigonometricFunction):

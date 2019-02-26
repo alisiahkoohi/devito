@@ -4,6 +4,7 @@ from os import environ, path
 from time import time
 from distutils import version
 from subprocess import DEVNULL, CalledProcessError, check_output, check_call
+from tempfile import mkdtemp
 import platform
 import warnings
 
@@ -12,7 +13,7 @@ from codepy.jit import compile_from_string
 from codepy.toolchain import GCCToolchain
 
 from devito.exceptions import CompilationError
-from devito.logger import log, warning
+from devito.logger import debug, warning
 from devito.parameters import configuration
 from devito.tools import (as_tuple, change_directory, filter_ordered,
                           memoized_func, make_tempdir)
@@ -22,7 +23,7 @@ __all__ = ['jit_compile', 'load', 'make', 'GNUCompiler']
 
 def sniff_compiler_version(cc):
     """
-    Try to detect the compiler version.
+    Detect the compiler version.
 
     Adapted from: ::
 
@@ -49,11 +50,13 @@ def sniff_compiler_version(cc):
         try:
             # gcc-7 series only spits out patch level on dumpfullversion.
             ver = check_output([cc, "-dumpfullversion"], stderr=DEVNULL).decode("utf-8")
-            ver = version.StrictVersion(ver.strip())
+            ver = '.'.join(ver.strip().split('.')[:3])
+            ver = version.StrictVersion(ver)
         except CalledProcessError:
             try:
                 ver = check_output([cc, "-dumpversion"], stderr=DEVNULL).decode("utf-8")
-                ver = version.StrictVersion(ver.strip())
+                ver = '.'.join(ver.strip().split('.')[:3])
+                ver = version.StrictVersion(ver)
             except (CalledProcessError, UnicodeDecodeError):
                 pass
         except UnicodeDecodeError:
@@ -68,17 +71,33 @@ def sniff_compiler_version(cc):
     return ver
 
 
+def sniff_mpi_distro(mpiexec):
+    """
+    Detect the MPI version.
+    """
+    try:
+        ver = check_output([mpiexec, "--version"]).decode("utf-8")
+        if "open-mpi" in ver:
+            return 'OpenMPI'
+        elif "HYDRA" in ver:
+            return 'MPICH'
+    except (CalledProcessError, UnicodeDecodeError):
+        pass
+    return 'unknown'
+
+
 class Compiler(GCCToolchain):
     """Base class for all compiler classes.
 
     The base class defaults all compiler specific settings to empty lists.
     Preset configurations can be built by inheriting from `Compiler` and setting
-    specific flags to the desired values, eg.:
+    specific flags to the desired values, e.g.:
 
-    def class MyCompiler(Compiler):
-        def __init__(self):
-            self.cc = 'mycompiler'
-            self.cflags += ['list', 'of', 'all', 'compiler', 'flags']
+    .. code-block:: python
+      def class MyCompiler(Compiler):
+          def __init__(self):
+              self.cc = 'mycompiler'
+              self.cflags += ['list', 'of', 'all', 'compiler', 'flags']
 
     The flags that can be set are:
         * :data:`self.cc`
@@ -92,26 +111,34 @@ class Compiler(GCCToolchain):
         * :data:`self.so_ext`
         * :data:`self.undefines`
 
-    Two additional keyword arguments may be passed.
-    :param suffix: A string indicating a specific compiler version available on
-                   the system. For example, assuming ``compiler=gcc`` and
-                   ``suffix='4.9'``, then the ``gcc-4.9`` program will be used
-                   to compile the generated code.
-    :param cpp: Defaults to False. Pass True to set up for C++ compilation,
-                instead of C compilation.
+    Parameters
+    ----------
+    suffix : str, optional
+        The JIT compiler version to be used. For example, assuming ``CC=gcc`` and
+        ``suffix='4.9'``, the ``gcc-4.9`` will be used as JIT compiler.
+    cpp : bool, optional
+        If True, JIT compile using a C++ compiler. Defaults to False.
+    mpi : bool, optional
+        If True, JIT compile using an MPI compiler. Defaults to False.
     """
 
     fields = {'cc', 'ld'}
 
     CC = 'unknown'
     CPP = 'unknown'
+    MPICC = 'unknown'
+    MPICXX = 'unknown'
 
     def __init__(self, **kwargs):
         super(Compiler, self).__init__(**kwargs)
 
         self.suffix = kwargs.get('suffix')
-        self.cc = self.CC if kwargs.get('cpp', False) is False else self.CPP
-        self.cc = self.cc if self.suffix is None else ('%s-%s' % (self.cc, self.suffix))
+        if not kwargs.get('mpi'):
+            self.cc = self.CC if kwargs.get('cpp', False) is False else self.CPP
+            self.cc = self.cc if self.suffix is None else ('%s-%s' %
+                                                           (self.cc, self.suffix))
+        else:
+            self.cc = self.MPICC if kwargs.get('cpp', False) is False else self.MPICXX
         self.ld = self.cc  # Wanted by the superclass
 
         self.cflags = ['-O3', '-g', '-fPIC', '-Wall', '-std=c99']
@@ -171,6 +198,8 @@ class GNUCompiler(Compiler):
 
     CC = 'gcc'
     CPP = 'g++'
+    MPICC = 'mpicc'
+    MPICXX = 'mpicxx'
 
     def __init__(self, *args, **kwargs):
         super(GNUCompiler, self).__init__(*args, **kwargs)
@@ -202,12 +231,18 @@ class ClangCompiler(Compiler):
     CC = 'clang'
     CPP = 'clang++'
 
+    def __init__(self, *args, **kwargs):
+        super(ClangCompiler, self).__init__(*args, **kwargs)
+        self.cflags += ['-march=native', '-Wno-unused-result', '-Wno-unused-variable']
+
 
 class IntelCompiler(Compiler):
     """Set of standard compiler flags for the Intel toolchain."""
 
     CC = 'icc'
     CPP = 'icpc'
+    MPICC = 'mpiicc'
+    MPICXX = 'mpicxx'
 
     def __init__(self, *args, **kwargs):
         super(IntelCompiler, self).__init__(*args, **kwargs)
@@ -240,8 +275,6 @@ class IntelKNLCompiler(IntelCompiler):
 class CustomCompiler(Compiler):
     """Custom compiler based on standard environment flags
 
-    :param openmp: Boolean indicating if openmp is enabled. False by default
-
     Note: Currently honours CC, CFLAGS and LDFLAGS, with defaults similar
     to the default GNU settings. If DEVITO_ARCH is enabled, the OpenMP linker
     flags are read from OMP_LDFLAGS or otherwise default to ``-fopenmp``.
@@ -249,6 +282,8 @@ class CustomCompiler(Compiler):
 
     CC = environ.get('CC', 'gcc')
     CPP = environ.get('CPP', 'g++')
+    MPICC = environ.get('MPICC', 'mpicc')
+    MPICXX = environ.get('MPICXX', 'mpicxx')
 
     def __init__(self, *args, **kwargs):
         super(CustomCompiler, self).__init__(*args, **kwargs)
@@ -261,17 +296,13 @@ class CustomCompiler(Compiler):
 
 @memoized_func
 def get_jit_dir():
-    """
-    A deterministic temporary directory for jit-compiled objects.
-    """
+    """A deterministic temporary directory for jit-compiled objects."""
     return make_tempdir('jitcache')
 
 
 @memoized_func
 def get_codepy_dir():
-    """
-    A deterministic temporary directory for the codepy cache.
-    """
+    """A deterministic temporary directory for the codepy cache."""
     return make_tempdir('codepy')
 
 
@@ -279,9 +310,15 @@ def load(soname):
     """
     Load a compiled shared object.
 
-    :param soname: Name of the .so file (w/o the suffix).
+    Parameters
+    ----------
+    soname : str
+        Name of the .so file (w/o the suffix).
 
-    :return: The loaded shared object.
+    Returns
+    -------
+    obj
+        The loaded shared object.
     """
     return npct.load_library(str(get_jit_dir().joinpath(soname)), '.')
 
@@ -290,35 +327,62 @@ def save(soname, binary, compiler):
     """
     Store a binary into a file within a temporary directory.
 
-    :param soname: Name of the .so file (w/o the suffix).
-    :param binary: The binary data.
-    :param compiler: The toolchain used for compilation.
+    Parameters
+    ----------
+    soname : str
+        Name of the .so file (w/o the suffix).
+    binary : obj
+        The binary data.
+    compiler : Compiler
+        The toolchain used for JIT compilation.
     """
     sofile = get_jit_dir().joinpath(soname).with_suffix(compiler.so_ext)
     if sofile.is_file():
-        log("%s: `%s` was not saved in `%s` as it already exists"
-            % (compiler, sofile.name, get_jit_dir()))
+        debug("%s: `%s` was not saved in `%s` as it already exists"
+              % (compiler, sofile.name, get_jit_dir()))
     else:
-        with open(str(path), 'wb') as f:
+        with open(str(sofile), 'wb') as f:
             f.write(binary)
-        log("%s: `%s` successfully saved in `%s`"
-            % (compiler, sofile.name, get_jit_dir()))
+        debug("%s: `%s` successfully saved in `%s`"
+              % (compiler, sofile.name, get_jit_dir()))
 
 
 def jit_compile(soname, code, compiler):
     """
-    JIT compile the given C/C++ ``code``.
+    JIT compile some source code given as a string.
 
     This function relies upon codepy's ``compile_from_string``, which performs
     caching of compilation units and avoids potential race conditions due to
     multiple processing trying to compile the same object.
 
-    :param soname: A unique name for the jit-compiled shared object.
-    :param code: String of C source code.
-    :param compiler: The toolchain used for compilation.
+    Parameters
+    ----------
+    soname : str
+        Name of the .so file (w/o the suffix).
+    code : str
+        The source code to be JIT compiled.
+    compiler : Compiler
+        The toolchain used for JIT compilation.
     """
     target = str(get_jit_dir().joinpath(soname))
     src_file = "%s.%s" % (target, compiler.src_ext)
+
+    if configuration['jit-backdoor'] is False:
+        # Typically we end up here
+        # Make a suite of cache directories based on the soname
+        cache_dir = get_codepy_dir().joinpath(soname[:7])
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        # Warning: dropping `code` on the floor in favor to whatever is written
+        # within `src_file`
+        try:
+            with open(src_file, 'r') as f:
+                code = f.read()
+            # Bypass the devito JIT cache
+            cache_dir = mkdtemp()
+        except FileNotFoundError:
+            raise ValueError("Trying to use the JIT backdoor for `%s`, but "
+                             "the file isn't present" % src_file)
 
     # `catch_warnings` suppresses codepy complaining that it's taking
     # too long to acquire the cache lock. This warning can only appear
@@ -326,22 +390,25 @@ def jit_compile(soname, code, compiler):
     # many processes are frequently attempting jit-compilation (e.g.,
     # when running the test suite in parallel)
     with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+
         tic = time()
+        # Spinlock in case of MPI
+        sleep_delay = 0 if configuration['mpi'] else 1
         _, _, _, recompiled = compile_from_string(compiler, target, code, src_file,
-                                                  cache_dir=get_codepy_dir(),
-                                                  debug=configuration['debug_compiler'])
+                                                  cache_dir=cache_dir,
+                                                  debug=configuration['debug-compiler'],
+                                                  sleep_delay=sleep_delay)
         toc = time()
 
     if recompiled:
-        log("%s: compiled `%s` [%.2f s]" % (compiler, src_file, toc-tic))
+        debug("%s: compiled `%s` [%.2f s]" % (compiler, src_file, toc-tic))
     else:
-        log("%s: cache hit `%s` [%.2f s]" % (compiler, src_file, toc-tic))
+        debug("%s: cache hit `%s` [%.2f s]" % (compiler, src_file, toc-tic))
 
 
 def make(loc, args):
-    """
-    Invoke ``make`` command from within ``loc`` with arguments ``args``.
-    """
+    """Invoke the ``make`` command from within ``loc`` with arguments ``args``."""
     hash_key = sha1((loc + str(args)).encode()).hexdigest()
     logfile = path.join(get_jit_dir(), "%s.log" % hash_key)
     errfile = path.join(get_jit_dir(), "%s.err" % hash_key)
@@ -364,7 +431,7 @@ def make(loc, args):
                                            'Compile errors in %s\n' %
                                            (e.cmd, e.returncode, logfile, errfile))
     toc = time()
-    log("Make <%s>: run in [%.2f s]" % (" ".join(args), toc-tic))
+    debug("Make <%s>: run in [%.2f s]" % (" ".join(args), toc-tic))
 
 
 # Registry dict for deriving Compiler classes according to the environment variable

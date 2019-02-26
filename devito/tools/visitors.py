@@ -41,7 +41,7 @@ class GenericVisitor(object):
             # Check the argument specification
             # Valid options are:
             #    visit_Foo(self, o, [*args, **kwargs])
-            argspec = inspect.getargspec(meth)
+            argspec = inspect.getfullargspec(meth)
             if len(argspec.args) < 2:
                 raise RuntimeError("Visit method signature must be "
                                    "visit_Foo(self, o, [*args, **kwargs])")
@@ -62,7 +62,8 @@ class GenericVisitor(object):
 
     @classmethod
     def default_retval(cls):
-        """A method that returns an object to use to populate return values.
+        """
+        A method that returns an object to use to populate return values.
 
         If your visitor combines values in a tree-walk, it may be useful to
         provide a object to combine the results into. :meth:`default_retval`
@@ -72,9 +73,13 @@ class GenericVisitor(object):
         return None
 
     def lookup_method(self, instance):
-        """Look up a handler method for a visitee.
+        """
+        Look up a handler method for a visitee.
 
-        :param instance: The instance to look up a method for.
+        Parameters
+        ----------
+        instance : object
+            The instance to look up a method for.
         """
         cls = instance.__class__
         try:
@@ -91,14 +96,30 @@ class GenericVisitor(object):
         raise RuntimeError("No handler found for class %s", cls.__name__)
 
     def visit(self, o, *args, **kwargs):
-        """Apply this :class:`Visitor` to an object.
-
-            :param o: The :class:`Node` to visit.
-            :param args: Optional arguments to pass to the visit methods.
-            :param kwargs: Optional keyword arguments to pass to the visit methods.
         """
+        Apply this :class:`Visitor` to an object.
+
+        Parameters
+        ----------
+        o : object
+            The object to be visited.
+        *args
+            Optional arguments to pass to the visit methods.
+        **kwargs
+            Optional keyword arguments to pass to the visit methods.
+        """
+        ret = self._visit(o, *args, **kwargs)
+        ret = self._post_visit(ret)
+        return ret
+
+    def _visit(self, o, *args, **kwargs):
+        """Visit ``o``."""
         meth = self.lookup_method(o)
         return meth(o, *args, **kwargs)
+
+    def _post_visit(self, ret):
+        """Postprocess the visitor output before returning it to the caller."""
+        return ret
 
     def visit_object(self, o, **kwargs):
         return self.default_retval()
