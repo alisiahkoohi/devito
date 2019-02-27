@@ -198,7 +198,7 @@ def GradientOperator(model, geometry, space_order=4, save=True,
     return Operator(eqn + receivers + [gradient_update], subs=model.spacing_map,
                     name='Gradient', **kwargs)
 
-def BornOperator(model, geometry, space_order=4,
+def BornOperator(model, geometry, space_order=4, save=True,
                  kernel='OT2', **kwargs):
     """
     Constructor method for the Linearized Born operator in an acoustic media
