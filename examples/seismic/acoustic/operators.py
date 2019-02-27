@@ -198,7 +198,7 @@ def GradientOperator(model, geometry, space_order=4, save=True,
     return Operator(eqn + receivers + [gradient_update], subs=model.spacing_map,
                     name='Gradient', **kwargs)
 
-def BornOperator(model, geometry, space_order=4,
+def BornOperator(model, geometry, space_order=4, save=None,
                  kernel='OT2', **kwargs):
     """
     Constructor method for the Linearized Born operator in an acoustic media
@@ -219,7 +219,7 @@ def BornOperator(model, geometry, space_order=4,
                    npoint=geometry.nrec)
 
     # Create wavefields and a dm field
-    u = TimeFunction(name="u", grid=model.grid, save=source.nt if save else None,
+    u = TimeFunction(name="u", grid=model.grid, save=src.nt if save else None,
                      time_order=2, space_order=space_order)
     U = TimeFunction(name="U", grid=model.grid, save=None,
                      time_order=2, space_order=space_order)
