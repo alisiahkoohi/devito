@@ -67,10 +67,10 @@ class AcousticWaveSolver(object):
                                 **self._kwargs)
 
     @memoized_meth
-    def op_born(self, save=False):
+    def op_born(self, save=None):
         """Cached operator for born runs"""
 
-        return BornOperator(self.model, save=None, geometry=self.geometry,
+        return BornOperator(self.model, save=save, geometry=self.geometry,
                             kernel=self.kernel, space_order=self.space_order,
                             **self._kwargs)
 
@@ -208,6 +208,7 @@ class AcousticWaveSolver(object):
 
         # Create the forward wavefields u and U if not provided
         u = u or TimeFunction(name='u', grid=self.model.grid,
+                              save= src.nt if save else None,
                               time_order=2, space_order=self.space_order)
         U = U or TimeFunction(name='U', grid=self.model.grid,
                               time_order=2, space_order=self.space_order)
