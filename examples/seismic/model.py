@@ -344,7 +344,7 @@ class Model(object):
     :param damp: The damping field for absorbing boundarycondition
     """
 
-    def __init__(self, origin, spacing, shape, space_order, vp, nbpml=20,
+    def __init__(self, origin, spacing, shape, space_order, vp, nbpml=20, rho=None,
                  dtype=np.float32, epsilon=None, delta=None, theta=None, phi=None, Mydt=0.):
         self.Mydt = Mydt
         self.shape = shape
@@ -366,6 +366,17 @@ class Model(object):
         # Set model velocity, which will also set `m`
         self.vp = vp
 
+        if rho is not None:
+            if isinstance(rho, np.ndarray):
+                self._physical_parameters += ('rho',)
+                self.rho = Function(name="rho", grid=self.grid, space_order=space_order)
+                initialize_function(self.rho, rho, self.nbpml)
+            else:
+                self.rho = rho
+        else:
+            self.rho = 1
+
+
         # Create dampening field as symbol `damp`
         self.damp = Function(name="damp", grid=self.grid)
         damp_boundary(self.damp, self.nbpml, spacing=self.spacing)
@@ -386,6 +397,7 @@ class Model(object):
                 self.scale = epsilon
         else:
             self.epsilon = 1
+
 
         if delta is not None:
             if isinstance(delta, np.ndarray):

@@ -1,12 +1,23 @@
 from sympy import solve, Symbol
 
-from devito import Eq, Operator, Function, TimeFunction, Inc
+from devito import Eq, Operator, Function, TimeFunction, Inc, first_derivative, left, right
 from devito.cgen_utils import INT
 from devito.logger import error
 from examples.seismic import PointSource, Receiver
 
+def acoustic_laplacian(v, rho):
+    if rho is None or rho==1:
+        Lap = v.laplace
+        rho = 1
+    else:
+        if isinstance(rho, Function):
+            Lap = sum([first_derivative(first_derivative(v, order=int(v.space_order/2), side=left, dim=d) / rho,
+                       order=int(v.space_order/2), dim=d, side=right) for d in v.space_dimensions])
+        else:
+            Lap = 1 / rho * v.laplace
+    return Lap
 
-def laplacian(field, m, s, kernel):
+def laplacian(field, m, s, kernel, rho=None):
     """
     Spacial discretization for the isotropic acoustic wave equation. For a 4th
     order in time formulation, the 4th order time derivative is replaced by a
@@ -22,7 +33,7 @@ def laplacian(field, m, s, kernel):
         raise ValueError("Unrecognized kernel")
 
     biharmonic = field.laplace2(1/m) if kernel == 'OT4' else 0
-    return field.laplace + s**2/12 * biharmonic
+    return acoustic_laplacian(field, rho) + s**2/12 * biharmonic
 
 
 def iso_stencil(field, m, s, damp, kernel, **kwargs):
@@ -49,7 +60,7 @@ def iso_stencil(field, m, s, damp, kernel, **kwargs):
     # Solve the symbolic equation for the field to be updated
     eq_time = solve(eq, next, rational=False, simplify=False)[0]
     # Get the spacial FD
-    lap = laplacian(field, m, s, kernel)
+    lap = laplacian(field, m, s, kernel, rho=kwargs.get('rho', None))
     # return the Stencil with H replaced by its symbolic expression
     return [Eq(next, eq_time.subs({H: lap}))]
 
@@ -97,7 +108,7 @@ def ForwardOperator(model, source, receiver, space_order=4,
     :param save: Saving flag, True saves all time steps, False only the three
     """
     m, damp = model.m, model.damp
-
+    rho = model.rho
     # Create symbols for forward wavefield, source and receivers
     u = TimeFunction(name='u', grid=model.grid,
                      save=source.nt if save else None,
@@ -108,7 +119,7 @@ def ForwardOperator(model, source, receiver, space_order=4,
                    npoint=receiver.npoint)
 
     s = model.grid.stepping_dim.spacing
-    eqn = iso_stencil(u, m, s, damp, kernel)
+    eqn = iso_stencil(u, m, s, damp, kernel, rho=rho)
 
     # Construct expression to inject source values
     src_term = src.inject(field=u.forward, expr=src * s**2 / m,

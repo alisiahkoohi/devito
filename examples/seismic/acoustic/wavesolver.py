@@ -77,7 +77,7 @@ class AcousticWaveSolver(object):
         return A(self.model, source=self.source, kernel=self.kernel,
                  space_order=self.space_order, **self._kwargs)
 
-    def forward(self, src=None, rec=None, u=None, m=None, save=None, **kwargs):
+    def forward(self, src=None, rec=None, u=None, m=None, rho=None, save=None, **kwargs):
         """
         Forward modelling function that creates the necessary
         data objects for running a forward modelling operator.
@@ -108,6 +108,11 @@ class AcousticWaveSolver(object):
         # Pick m from model unless explicitly provided
         if m is None:
             m = m or self.model.m
+        if rho is None:
+            rho = rho or self.model.rho
+            if rho is not None and rho!=1:
+                kwargs["rho"] = rho
+
 
         # Execute operator and return wavefield and receiver data
         summary = self.op_fwd(save).apply(src=src, rec=rec, u=u, m=m,
