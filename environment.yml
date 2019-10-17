@@ -1,4 +1,4 @@
-name: devito-letter
+name: devito-customized
 channels:
   - defaults
   - conda-forge
@@ -26,6 +26,7 @@ dependencies:
   - pytest-cov
   - multidict
   - frozendict
+  - h5py
   - pip:
     - "git+https://github.com/inducer/codepy"
     - "git+https://github.com/opesci/pyrevolve"
